@@ -1251,9 +1251,10 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	program->dbg_print_reloc = true;
 
-	// Existing programs keep late-resolving import thunks. Re-running their relocation
-	// tables while guest code is active can overwrite live runtime state.
 	rt->RelocateProgram(program);
+	// A reloaded module may satisfy function and object imports left pending after unload.
+	// Patch only unresolved targets; relocating every live program can change valid bindings.
+	rt->RebindUnresolvedImports();
 
 	int result = rt->StartModule(program, args, argp, nullptr);
 

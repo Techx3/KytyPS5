@@ -2506,9 +2506,20 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestUnresolvedImportRebindClassifier() {
+	const char* test = "UnresolvedImportRebindClassifier";
+	Check(test, Loader::TestUnresolvedImportRebindClassifier(),
+	      "resolved import targets were not kept distinct from pending targets");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+	if (argc == 2 && std::strcmp(argv[1], "--import-rebind-only") == 0) {
+		RunTest(TestUnresolvedImportRebindClassifier);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
@@ -2563,6 +2574,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestUnresolvedImportRebindClassifier);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

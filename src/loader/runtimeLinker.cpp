@@ -1218,6 +1218,60 @@ static void RelocateRecords(Elf64_Rela* records, uint64_t size, Program* program
 	}
 }
 
+static bool IsUnresolvedImportTarget(uint64_t patch_vaddr, uint64_t current,
+                                     uint64_t                                invalid_memory,
+                                     const std::vector<StubbedImportRecord>& stubs) {
+	if (current == 0 || current == invalid_memory) {
+		return true;
+	}
+	return std::ranges::any_of(stubs, [=](const auto& record) {
+		return record.patch_vaddr == patch_vaddr && record.thunk_vaddr == current;
+	});
+}
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestUnresolvedImportRebindClassifier() {
+	const std::vector<StubbedImportRecord> stubs = {{.patch_vaddr = 0x1000, .thunk_vaddr = 0x2000}};
+	return IsUnresolvedImportTarget(0x1000, 0, 0x3000, stubs) &&
+	       IsUnresolvedImportTarget(0x1000, 0x3000, 0x3000, stubs) &&
+	       IsUnresolvedImportTarget(0x1000, 0x2000, 0x3000, stubs) &&
+	       !IsUnresolvedImportTarget(0x1001, 0x2000, 0x3000, stubs) &&
+	       !IsUnresolvedImportTarget(0x1000, 0x4000, 0x3000, stubs);
+}
+#endif
+
+static uint32_t RebindUnresolvedRecords(Elf64_Rela* records, uint64_t size, Program* program) {
+	uint32_t rebound = 0;
+	uint32_t index   = 0;
+	for (auto* r = records;
+	     reinterpret_cast<uint8_t*>(r) < reinterpret_cast<uint8_t*>(records) + size; r++, index++) {
+		auto ri = GetRelocationInfo(r, program);
+		if (!ri.resolved || ri.bind_self ||
+		    (ri.bind != BindType::Global && ri.bind != BindType::Weak)) {
+			continue;
+		}
+
+		uint64_t current = 0;
+		std::memcpy(&current, reinterpret_cast<const void*>(ri.vaddr), sizeof(current));
+		const bool unresolved_no_type =
+		    ri.type == SymbolType::NoType &&
+		    current == RuntimeLinker::ReadFromElf(program, ri.vaddr) + ri.base_vaddr;
+		if (!unresolved_no_type &&
+		    !IsUnresolvedImportTarget(ri.vaddr, current, g_invalid_memory, g_stubbed_imports)) {
+			continue;
+		}
+
+		if (PatchGuestMemory64(ri.vaddr, ri.value)) {
+			rebound++;
+			LOGF("Rebound unresolved import [%u] [0x%016" PRIx64 "] <- 0x%016" PRIx64
+			     ", %s, %s, %s\n",
+			     index, ri.vaddr, ri.value, ri.name.c_str(), Common::EnumName(ri.type).c_str(),
+			     Common::PathToString(program->file_name).c_str());
+		}
+	}
+	return rebound;
+}
+
 __attribute__((naked)) static KYTY_SYSV_ABI void RelocateHandlerReturnStub() {
 	asm volatile("addq $8, %rsp\n\t"
 	             "retq\n");
@@ -1432,6 +1486,26 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	Relocate(program);
+	WriteConfiguredUnresolvedImportReport();
+}
+
+void RuntimeLinker::RebindUnresolvedImports() {
+	Common::LockGuard lock(m_mutex);
+
+	uint32_t rebound = 0;
+	for (auto* program: m_programs) {
+		if (program == nullptr || !program->relocated) {
+			continue;
+		}
+		rebound += RebindUnresolvedRecords(program->dynamic_info->rela_table,
+		                                   program->dynamic_info->rela_table_total_size, program);
+		rebound += RebindUnresolvedRecords(program->dynamic_info->jmprela_table,
+		                                   program->dynamic_info->jmprela_table_size, program);
+	}
+
+	if (rebound != 0) {
+		LOGF("Rebound %u unresolved imports after module load\n", rebound);
+	}
 	WriteConfiguredUnresolvedImportReport();
 }
 
