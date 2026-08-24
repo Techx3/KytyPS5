@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <optional>
 #include <span>
 #include <unordered_set>
 #include <utility>
@@ -62,6 +63,138 @@ Value CanonicalizeSampleAdjustDword3(Value value) {
 			return value;
 		}
 	}
+}
+
+Value CanonicalizeZeroInitializedPhi(const ValueProgram& program, Value value) {
+	value                = value.Resolve();
+	const auto* root_phi = value.TryInstruction();
+	if (root_phi == nullptr || root_phi->GetOpcode() != ValueOpcode::Phi) {
+		return value;
+	}
+	if (const auto invariant = ResolveInvariantPhi(program, value); !invariant.IsEmpty()) {
+		return invariant;
+	}
+
+	Value                           candidate;
+	std::vector<Value>              pending {value};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		auto current = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = current.TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+			if (!visited.insert(inst).second) {
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+			continue;
+		}
+		if (current.IsImmediate() && current.GetType() == Type::U32 && current.U32() == 0) {
+			continue;
+		}
+		if (candidate.IsEmpty()) {
+			candidate = current;
+		} else if (!EquivalentValue(program, candidate, current)) {
+			return value;
+		}
+	}
+
+	// Structured early exits can merge a live descriptor with the zero-initialized
+	// scalar-register state of a terminated path. Keep the sole live source, but
+	// never choose between distinct runtime descriptors.
+	return candidate.IsEmpty() ? value : candidate;
+}
+
+std::optional<bool> BooleanOnIncomingEdge(Value value, const Block* merge, const Block* predecessor,
+                                          std::unordered_set<const Inst*>& visiting) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U1 ? std::optional<bool>(value.U1()) : std::nullopt;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || !visiting.insert(inst).second) {
+		return std::nullopt;
+	}
+	const auto finish = [&](std::optional<bool> result) {
+		visiting.erase(inst);
+		return result;
+	};
+	if (inst->GetOpcode() == ValueOpcode::Phi && inst->Parent() == merge) {
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			if (inst->PhiBlock(index) == predecessor) {
+				return finish(
+				    BooleanOnIncomingEdge(inst->Arg(index), merge, predecessor, visiting));
+			}
+		}
+		return finish(std::nullopt);
+	}
+	if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+		const auto operand = BooleanOnIncomingEdge(inst->Arg(0), merge, predecessor, visiting);
+		return finish(operand.has_value() ? std::optional<bool>(!*operand) : std::nullopt);
+	}
+	return finish(std::nullopt);
+}
+
+std::optional<bool> BooleanOnIncomingEdge(Value value, const Block* merge,
+                                          const Block* predecessor) {
+	std::unordered_set<const Inst*> visiting;
+	return BooleanOnIncomingEdge(value, merge, predecessor, visiting);
+}
+
+Value CanonicalizeInactivePhi(const ValueProgram& program, const Inst& user, Value value) {
+	value                = value.Resolve();
+	const auto* root_phi = value.TryInstruction();
+	if (root_phi == nullptr || root_phi->GetOpcode() != ValueOpcode::Phi) {
+		return value;
+	}
+	const auto* merge      = root_phi->Parent();
+	const auto* user_block = user.Parent();
+	if (merge == nullptr || user_block == nullptr ||
+	    std::ranges::find(merge->ImmSuccessors(), user_block) == merge->ImmSuccessors().end()) {
+		return value;
+	}
+	const auto merge_it = std::ranges::find(program.blocks, merge);
+	const auto user_it  = std::ranges::find(program.blocks, user_block);
+	if (merge_it == program.blocks.end() || user_it == program.blocks.end() ||
+	    program.block_info.size() != program.blocks.size()) {
+		return value;
+	}
+	const auto  merge_index = static_cast<size_t>(std::distance(program.blocks.begin(), merge_it));
+	const auto  user_index  = static_cast<size_t>(std::distance(program.blocks.begin(), user_it));
+	const auto& info        = program.block_info[merge_index];
+	if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
+		return value;
+	}
+	const auto          target_id = program.block_info[user_index].id;
+	std::optional<bool> target;
+	if (info.terminator.true_block == target_id) {
+		target = true;
+	} else if (info.terminator.false_block == target_id) {
+		target = false;
+	} else {
+		return value;
+	}
+
+	Value candidate;
+	bool  discarded = false;
+	for (size_t index = 0; index < root_phi->NumArgs(); index++) {
+		const auto edge = BooleanOnIncomingEdge(info.condition, merge, root_phi->PhiBlock(index));
+		if (edge.has_value() && edge != target) {
+			discarded = true;
+			continue;
+		}
+		const auto current = root_phi->Arg(index).Resolve();
+		if (candidate.IsEmpty()) {
+			candidate = current;
+		} else if (!EquivalentValue(program, candidate, current)) {
+			return value;
+		}
+	}
+
+	// Ignore values arriving only on an edge that cannot branch to this resource use.
+	return discarded && !candidate.IsEmpty() ? candidate : value;
 }
 
 const char* StageName(ShaderType stage) {
@@ -274,7 +407,8 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = handle.Arg(i).Resolve();
+			auto dword           = CanonicalizeInactivePhi(m_values, handle, handle.Arg(i));
+			descriptor.dwords[i] = CanonicalizeZeroInitializedPhi(m_values, dword);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);

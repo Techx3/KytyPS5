@@ -21,6 +21,7 @@ namespace {
 using namespace Libs::Graphics::ShaderRecompiler::IR;
 using Libs::Graphics::ShaderComputeInputInfo;
 using Libs::Graphics::ShaderType;
+namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
 namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
 
 void Check(bool condition, const char *message) {
@@ -977,6 +978,103 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
+void TestZeroInitializedDescriptorPhi() {
+  Fixture fixture;
+  auto *live = fixture.block;
+  auto *terminated = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  live->AddBranch(merge);
+  terminated->AddBranch(merge);
+  const auto descriptor_word = fixture.UserData(0);
+  auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                   static_cast<uint64_t>(Type::U32));
+  phi.AddPhiOperand(live, descriptor_word);
+  phi.AddPhiOperand(terminated, Value(0u));
+  const auto handle =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {Value(&phi), Value(0u), Value(64u), Value(0u)},
+                   MemoryFlags{0, 0x1b0}, merge);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 0x1b0), merge);
+  fixture.PlanAndTrack();
+
+  std::array<uint32_t, 1> user_data{0x12345678u};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  std::string error;
+  Check(EvaluateDescriptorSource(fixture.program,
+                                 fixture.program.info.buffers[0].source, 4,
+                                 runtime, descriptor, &error) &&
+            descriptor.dwords[0] == user_data[0],
+        "zero-initialized descriptor phi did not retain its live source");
+}
+
+void TestInactiveDescriptorPhiEdge() {
+  Fixture fixture;
+  auto *terminated = fixture.block;
+  auto *live = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  auto *resource = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  terminated->AddBranch(merge);
+  live->AddBranch(merge);
+  merge->AddBranch(resource);
+  merge->AddBranch(exit);
+
+  const auto terminated_word = fixture.UserData(0);
+  const auto live_word = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))}, 0, live);
+  auto &condition = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                         static_cast<uint64_t>(Type::U1));
+  condition.AddPhiOperand(terminated, Value(false));
+  condition.AddPhiOperand(live, Value(true));
+  auto &descriptor_phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                              static_cast<uint64_t>(Type::U32));
+  descriptor_phi.AddPhiOperand(terminated, terminated_word);
+  descriptor_phi.AddPhiOperand(live, live_word);
+
+  const auto merge_index = static_cast<size_t>(
+      std::distance(fixture.program.values->blocks.begin(),
+                    std::ranges::find(fixture.program.values->blocks, merge)));
+  const auto resource_index = static_cast<size_t>(std::distance(
+      fixture.program.values->blocks.begin(),
+      std::ranges::find(fixture.program.values->blocks, resource)));
+  const auto exit_index = static_cast<size_t>(
+      std::distance(fixture.program.values->blocks.begin(),
+                    std::ranges::find(fixture.program.values->blocks, exit)));
+  auto &merge_info = fixture.program.values->block_info[merge_index];
+  merge_info.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  merge_info.terminator.true_block =
+      fixture.program.values->block_info[resource_index].id;
+  merge_info.terminator.false_block =
+      fixture.program.values->block_info[exit_index].id;
+  merge_info.condition = Value(&condition);
+
+  const auto handle =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {Value(&descriptor_phi), Value(0u), Value(64u), Value(0u)},
+                   MemoryFlags{0, 0x3d0}, resource);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 0x3d0), resource);
+  fixture.PlanAndTrack();
+
+  std::array<uint32_t, 2> user_data{0xdeadbeefu, 0x12345678u};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  std::string error;
+  Check(EvaluateDescriptorSource(fixture.program,
+                                 fixture.program.info.buffers[0].source, 4,
+                                 runtime, descriptor, &error) &&
+            descriptor.dwords[0] == user_data[1],
+        "descriptor phi retained a value from the terminating branch");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -1393,6 +1491,8 @@ int main() {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
+    Run("zero-initialized descriptor phi", TestZeroInitializedDescriptorPhi);
+    Run("inactive descriptor phi edge", TestInactiveDescriptorPhiEdge);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("address materialization", TestAddressMaterializationAndSpecialization);
@@ -1421,6 +1521,17 @@ int DbgExitIfHandler(const char *expression, const char *file, int line) {
 
 void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 } // namespace Common
+
+namespace Libs::Graphics {
+bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo &info,
+                                uint32_t input) {
+  constexpr uint32_t FlatShade = 0x00000400u;
+  const bool custom =
+      input < 32u && (info.custom_interpolation_mask & (1u << input)) != 0;
+  return input < info.input_num &&
+         (info.interpolator_settings[input] & FlatShade) != 0 && !custom;
+}
+} // namespace Libs::Graphics
 
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.
