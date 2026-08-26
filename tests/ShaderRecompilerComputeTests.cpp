@@ -1546,6 +1546,15 @@ public:
     for (auto &command : commands) {
       command->WaitForFence();
     }
+    for (auto &command : commands) {
+      command->WaitForFenceAndReset();
+      command->Begin();
+      command->End();
+      command->Execute();
+    }
+    for (auto &command : commands) {
+      command->WaitForFence();
+    }
     std::printf("[host]    %-32s ok\n", "CommandPoolGrowth");
   }
 
@@ -22631,6 +22640,20 @@ void CheckImageTransitionState(RenderContext &renderer) {
   };
   const auto graphics_stage = vk::PipelineStageFlagBits2::eAllGraphics |
                               vk::PipelineStageFlagBits2::eComputeShader;
+  Require(
+      name, "precise attachment stages",
+      Image::DestinationStages(vk::AccessFlagBits2::eColorAttachmentWrite) ==
+              vk::PipelineStageFlagBits2::eColorAttachmentOutput &&
+          Image::DestinationStages(
+              vk::AccessFlagBits2::eDepthStencilAttachmentRead) ==
+              (vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+               vk::PipelineStageFlagBits2::eLateFragmentTests),
+      "attachment access used broad graphics/compute stages");
+  Require(name, "mixed destination stages",
+          Image::DestinationStages(vk::AccessFlagBits2::eShaderRead |
+                                   vk::AccessFlagBits2::eTransferRead) ==
+              (graphics_stage | vk::PipelineStageFlagBits2::eAllTransfer),
+          "mixed shader/transfer access omitted a required pipeline stage");
   constexpr uint64_t copy_capacity = 128ull << 20;
   Require(
       name, "buffered-copy capacity bands",

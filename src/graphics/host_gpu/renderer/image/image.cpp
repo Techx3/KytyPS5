@@ -99,6 +99,39 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+vk::PipelineStageFlags2 Image::DestinationStages(vk::AccessFlags2 destination_access) noexcept {
+	vk::PipelineStageFlags2 stages {};
+	if (destination_access &
+	    (vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite)) {
+		stages |= vk::PipelineStageFlagBits2::eAllTransfer;
+	}
+	if (destination_access &
+	    (vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite)) {
+		stages |= vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+	}
+	if (destination_access & (vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+	                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite)) {
+		stages |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		          vk::PipelineStageFlagBits2::eLateFragmentTests;
+	}
+	if (destination_access & (vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+	                          vk::AccessFlagBits2::eUniformRead)) {
+		stages |=
+		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+	}
+	if (destination_access & vk::AccessFlagBits2::eInputAttachmentRead) {
+		stages |= vk::PipelineStageFlagBits2::eFragmentShader;
+	}
+	if (destination_access & (vk::AccessFlagBits2::eHostRead | vk::AccessFlagBits2::eHostWrite)) {
+		stages |= vk::PipelineStageFlagBits2::eHost;
+	}
+	if (!destination_access || destination_access & (vk::AccessFlagBits2::eMemoryRead |
+	                                                 vk::AccessFlagBits2::eMemoryWrite)) {
+		stages |= vk::PipelineStageFlagBits2::eAllCommands;
+	}
+	return stages != vk::PipelineStageFlags2 {} ? stages : vk::PipelineStageFlagBits2::eAllCommands;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -196,19 +229,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
-	const auto transfer_access =
-	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
-	vk::PipelineStageFlags2 destination_stage {};
-	if (static_cast<bool>(destination_access & transfer_access)) {
-		destination_stage |= vk::PipelineStageFlagBits2::eTransfer;
-	}
-	if (!destination_access ||
-	    static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
-		destination_stage |=
-		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
-	}
-	const auto barriers =
-	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	const auto barriers = GetBarriers(destination_layout, destination_access,
+	                                  DestinationStages(destination_access), range);
 	if (barriers.empty()) {
 		return;
 	}

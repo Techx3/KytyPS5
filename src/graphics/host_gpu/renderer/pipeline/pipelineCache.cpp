@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -13,12 +15,36 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
 namespace {
+
+constexpr uint64_t MaxPipelineCacheSize = 64ull * 1024ull * 1024ull;
+
+std::filesystem::path DriverCachePath(const GraphicContext& graphics) {
+	const auto&        properties = graphics.GetPhysicalDeviceProperties();
+	Common::ByteBuffer uuid(properties.pipelineCacheUUID.data(), VK_UUID_SIZE);
+	return std::filesystem::path("_PipelineCache") / (Common::HexFromBin(uuid) + ".bin");
+}
+
+bool IsCompatibleDriverCache(const Common::ByteBuffer&           data,
+                             const vk::PhysicalDeviceProperties& properties) {
+	if (data.Size() < sizeof(VkPipelineCacheHeaderVersionOne)) {
+		return false;
+	}
+	VkPipelineCacheHeaderVersionOne header {};
+	std::memcpy(&header, data.GetDataConst(), sizeof(header));
+	return header.headerSize >= sizeof(header) && header.headerSize <= data.Size() &&
+	       header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+	       header.vendorID == properties.vendorID && header.deviceID == properties.deviceID &&
+	       std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID.data(),
+	                   VK_UUID_SIZE) == 0;
+}
 
 void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_params) {
 	static_params.viewport_scale[0]  = 0.5f;
@@ -36,6 +62,100 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 
 } // namespace
 
+PipelineCache::PipelineCache(GraphicContext& graphics): m_graphics(graphics) {
+	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	CreateDriverCache();
+}
+
+void PipelineCache::CreateDriverCache() {
+	EXIT_IF(m_graphics.device == nullptr || m_driver_cache != nullptr);
+	m_driver_cache_path = DriverCachePath(m_graphics);
+
+	Common::ByteBuffer initial_data;
+	if (Common::File::IsFileExisting(m_driver_cache_path)) {
+		const auto size = Common::File::Size(m_driver_cache_path);
+		if (size > 0 && size <= MaxPipelineCacheSize) {
+			Common::File file(m_driver_cache_path, Common::File::Mode::Read);
+			if (!file.IsInvalid()) {
+				initial_data = file.ReadWholeBuffer();
+				file.Close();
+			}
+		}
+	}
+	if (!IsCompatibleDriverCache(initial_data, m_graphics.GetPhysicalDeviceProperties())) {
+		initial_data.Clear();
+	}
+
+	vk::PipelineCacheCreateInfo create {};
+	create.sType           = vk::StructureType::ePipelineCacheCreateInfo;
+	create.initialDataSize = initial_data.Size();
+	create.pInitialData    = initial_data.IsEmpty() ? nullptr : initial_data.GetDataConst();
+	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+	if (result != vk::Result::eSuccess && !initial_data.IsEmpty()) {
+		LOGF("Vulkan pipeline cache rejected; rebuilding it: %s\n", VulkanToString(result).c_str());
+		create.initialDataSize = 0;
+		create.pInitialData    = nullptr;
+		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_driver_cache == nullptr);
+	LOGF("Vulkan pipeline cache: %s (%u bytes)\n",
+	     Common::PathToGenericString(m_driver_cache_path).c_str(), initial_data.Size());
+}
+
+void PipelineCache::Save() {
+	Common::LockGuard lock(m_mutex);
+	if (m_driver_cache == nullptr || m_graphics.device == nullptr || m_driver_cache_path.empty()) {
+		return;
+	}
+
+	size_t size   = 0;
+	auto   result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+	if (result != vk::Result::eSuccess || size == 0 || size > MaxPipelineCacheSize ||
+	    size > std::numeric_limits<uint32_t>::max()) {
+		LOGF("Vulkan pipeline cache size query failed: %s, size=%" PRIu64 "\n",
+		     VulkanToString(result).c_str(), static_cast<uint64_t>(size));
+		return;
+	}
+
+	Common::ByteBuffer data(static_cast<uint32_t>(size));
+	result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, data.GetData());
+	if (result != vk::Result::eSuccess || size == 0 || size > data.Size()) {
+		LOGF("Vulkan pipeline cache read failed: %s, size=%" PRIu64 "\n",
+		     VulkanToString(result).c_str(), static_cast<uint64_t>(size));
+		return;
+	}
+	if (size < data.Size()) {
+		data.RemoveAt(static_cast<uint32_t>(size), data.Size() - static_cast<uint32_t>(size));
+	}
+	if (!IsCompatibleDriverCache(data, m_graphics.GetPhysicalDeviceProperties())) {
+		LOGF("Vulkan pipeline cache produced incompatible data\n");
+		return;
+	}
+
+	const auto directory = m_driver_cache_path.parent_path();
+	if (!Common::File::IsDirectoryExisting(directory) &&
+	    !Common::File::CreateDirectories(directory)) {
+		LOGF("Vulkan pipeline cache directory creation failed: %s\n",
+		     Common::PathToGenericString(directory).c_str());
+		return;
+	}
+	Common::File file;
+	if (!file.Create(m_driver_cache_path)) {
+		LOGF("Vulkan pipeline cache open failed: %s\n",
+		     Common::PathToGenericString(m_driver_cache_path).c_str());
+		return;
+	}
+	uint32_t written = 0;
+	file.Write(data.GetDataConst(), data.Size(), &written);
+	const bool flushed = file.Flush();
+	file.Close();
+	if (written != data.Size() || !flushed) {
+		LOGF("Vulkan pipeline cache write failed: %u/%u bytes\n", written, data.Size());
+		return;
+	}
+	LOGF("Vulkan pipeline cache saved: %u bytes\n", written);
+}
+
 PipelineCache::~PipelineCache() {
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -47,6 +167,11 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	Save();
+	if (m_driver_cache != nullptr) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
@@ -211,9 +336,9 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	auto cached = std::make_unique<GraphicsPipeline>(p);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
-	CreatePipelineInternal(m_graphics, *cached, rendering, vs_input_info, vs_spirv, ps_input_info,
-	                       ps_spirv, static_params, vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                       ps_id.crc32, ps_active);
+	CreatePipelineInternal(m_graphics, m_driver_cache, *cached, rendering, vs_input_info, vs_spirv,
+	                       ps_input_info, ps_spirv, static_params, vs_id.hash0, vs_id.crc32,
+	                       ps_id.hash0, ps_id.crc32, ps_active);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
 
@@ -253,7 +378,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
-	CreatePipelineInternal(m_graphics, *cached, input_info, cs_spirv);
+	CreatePipelineInternal(m_graphics, m_driver_cache, *cached, input_info, cs_spirv);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

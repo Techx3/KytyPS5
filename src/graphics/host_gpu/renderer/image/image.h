@@ -51,6 +51,8 @@ public:
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	[[nodiscard]] static vk::PipelineStageFlags2
+	                       DestinationStages(vk::AccessFlags2 destination_access) noexcept;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
@@ -139,18 +141,18 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
-	ImageInfo        info;
-	VulkanImage      backing;
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
-	mutable uint32_t query_epoch    = 0;
-	uint64_t         track_addr     = 0;
-	uint64_t         track_addr_end = 0;
-	ImageId          depth_id {};
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered     = false;
+	mutable uint32_t             query_epoch    = 0;
+	uint64_t                     track_addr     = 0;
+	uint64_t                     track_addr_end = 0;
+	ImageId                      depth_id {};
+	uint64_t                     tick_accessed_last = 0;
+	size_t                       lru_id             = 0;
 
 private:
 	friend struct ImageTestAccess;

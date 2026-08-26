@@ -26,6 +26,8 @@ enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
 
+enum class PresentMode { Fifo, Mailbox, FifoRelaxed, Immediate };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -37,6 +39,7 @@ struct ConfigOptions {
 	uint32_t               screen_width                    = 1280;
 	uint32_t               screen_height                   = 720;
 	bool                   fullscreen_enabled              = false;
+	PresentMode            present_mode                    = PresentMode::Fifo;
 	uint32_t               vblank_frequency                = 60;
 	uint32_t               console_language                = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled       = false;
@@ -47,6 +50,7 @@ struct ConfigOptions {
 	bool                   command_buffer_dump_enabled     = false;
 	std::filesystem::path  command_buffer_dump_folder      = "_Buffers";
 	bool                   graphics_debug_dump_enabled     = false;
+	bool                   gpu_performance_metrics_enabled = false;
 	OutputDirection        printf_direction                = OutputDirection::Silent;
 	std::filesystem::path  printf_output_file              = "_kyty.txt";
 	ProfilerDirection      profiler_direction              = ProfilerDirection::None;
@@ -67,12 +71,13 @@ struct ConfigOptions {
 
 void Load(const ConfigOptions& cfg);
 
-uint32_t GetScreenWidth();
-uint32_t GetScreenHeight();
-bool     FullscreenEnabled();
-uint32_t GetVblankFrequency();
-uint32_t GetConsoleLanguage();
-bool     VulkanValidationEnabled();
+uint32_t    GetScreenWidth();
+uint32_t    GetScreenHeight();
+bool        FullscreenEnabled();
+PresentMode GetPresentMode();
+uint32_t    GetVblankFrequency();
+uint32_t    GetConsoleLanguage();
+bool        VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
@@ -83,6 +88,7 @@ bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
+bool GpuPerformanceMetricsEnabled();
 
 OutputDirection       GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();

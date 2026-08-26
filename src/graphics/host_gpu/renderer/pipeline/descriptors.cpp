@@ -1145,14 +1145,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
-	size_t descriptor_count = 0;
-	size_t write_count      = 0;
+	auto           vk_buffer        = buffer.Handle();
+	size_t         descriptor_count = 0;
+	size_t         write_count      = 0;
 	constexpr auto GraphicsStages =
 	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-	const auto push_constant_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-	                                      ? vk::ShaderStageFlags {GraphicsStages}
-	                                      : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
+	const auto push_constant_stages =
+	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics
+	        ? vk::ShaderStageFlags {GraphicsStages}
+	        : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
 		        prepared->snapshot == nullptr || prepared->committed);
@@ -1189,6 +1190,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		Image::Barriers image_barriers;
+		image_barriers.reserve(program.info.images.size());
+		const auto AppendBarriers = [&image_barriers](Image::Barriers&& barriers) {
+			image_barriers.insert(image_barriers.end(), std::make_move_iterator(barriers.begin()),
+			                      std::make_move_iterator(barriers.end()));
+		};
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
@@ -1197,31 +1204,42 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 			if (image.info.data.Empty()) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              storage ? vk::AccessFlagBits2::eShaderRead |
-				                            vk::AccessFlagBits2::eShaderWrite
-				                      : vk::AccessFlagBits2::eShaderRead,
-				              range, vk_buffer);
+				const auto access =
+				    storage ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+				            : vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead};
+				AppendBarriers(image.GetBarriers(vk::ImageLayout::eGeneral, access,
+				                                 Image::DestinationStages(access), range));
 			} else if ((image.binding.force_general || image.binding.is_target) &&
 			           !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access |
-				                  vk::AccessFlagBits2::eColorAttachmentRead |
-				                  vk::AccessFlagBits2::eColorAttachmentWrite,
-				              {}, vk_buffer);
+				const auto             access = vk::AccessFlagBits2::eShaderRead | storage_access |
+				                                vk::AccessFlagBits2::eColorAttachmentRead |
+				                                vk::AccessFlagBits2::eColorAttachmentWrite;
+				AppendBarriers(image.GetBarriers(vk::ImageLayout::eGeneral, access,
+				                                 Image::DestinationStages(access), {}));
 			} else if (storage) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
+				const auto access =
+				    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+				AppendBarriers(image.GetBarriers(vk::ImageLayout::eGeneral, access,
+				                                 Image::DestinationStages(access), range));
 			} else {
-				image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
-				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+				const auto access = vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead};
+				AppendBarriers(image.GetBarriers(image.info.IsDepth()
+				                                     ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+				                                     : vk::ImageLayout::eShaderReadOnlyOptimal,
+				                                 access, Image::DestinationStages(access), range));
 			}
 			binding.layout = image.backing.state.layout;
+		}
+		if (!image_barriers.empty()) {
+			buffer.EndRendering();
+			vk::DependencyInfo dependency {};
+			dependency.dependencyFlags         = vk::DependencyFlagBits::eByRegion;
+			dependency.imageMemoryBarrierCount = static_cast<uint32_t>(image_barriers.size());
+			dependency.pImageMemoryBarriers    = image_barriers.data();
+			vk_buffer.pipelineBarrier2(dependency);
 		}
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
@@ -1302,8 +1320,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 	vk_buffer.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
-	                        ShaderRecompiler::IR::NativePushConstantSize,
-	                        m_push_constants.data());
+	                        ShaderRecompiler::IR::NativePushConstantSize, m_push_constants.data());
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);

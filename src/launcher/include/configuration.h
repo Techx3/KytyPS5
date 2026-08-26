@@ -61,6 +61,9 @@ public:
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
 
+	enum class PresentMode { Fifo, Mailbox, FifoRelaxed, Immediate };
+	Q_ENUM(PresentMode)
+
 	enum class ShaderLogDirection { Silent, Console, File };
 	Q_ENUM(ShaderLogDirection)
 
@@ -85,21 +88,23 @@ public:
 	GameStatus game_status     = GameStatus::Unknown;
 	QString    game_comment;
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
-	bool                   fullscreen_enabled          = false;
-	int                    vblank_frequency            = 60;
-	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
-	bool                   vulkan_validation_enabled   = false;
-	bool                   shader_validation_enabled   = true;
-	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
-	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
-	QString                shader_log_folder           = "_Shaders";
-	bool                   command_buffer_dump_enabled = false;
-	QString                command_buffer_dump_folder  = "_Buffers";
-	LogDirection           printf_direction            = LogDirection::Silent;
-	QString                printf_output_file          = "_kyty.txt";
-	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
-	bool                   renderdoc_enabled           = false;
+	Resolution             screen_resolution               = Resolution::R1280X720;
+	bool                   fullscreen_enabled              = false;
+	PresentMode            present_mode                    = PresentMode::Fifo;
+	int                    vblank_frequency                = 60;
+	int                    console_language                = DEFAULT_CONSOLE_LANGUAGE;
+	bool                   vulkan_validation_enabled       = false;
+	bool                   shader_validation_enabled       = true;
+	ShaderOptimizationType shader_optimization_type        = ShaderOptimizationType::Performance;
+	ShaderLogDirection     shader_log_direction            = ShaderLogDirection::Silent;
+	QString                shader_log_folder               = "_Shaders";
+	bool                   command_buffer_dump_enabled     = false;
+	bool                   gpu_performance_metrics_enabled = false;
+	QString                command_buffer_dump_folder      = "_Buffers";
+	LogDirection           printf_direction                = LogDirection::Silent;
+	QString                printf_output_file              = "_kyty.txt";
+	ProfilerDirection      profiler_direction              = ProfilerDirection::None;
+	bool                   renderdoc_enabled               = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -108,21 +113,23 @@ public:
 	QString elf = QStringLiteral("eboot.bin");
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
-		screen_resolution           = other.screen_resolution;
-		fullscreen_enabled          = other.fullscreen_enabled;
-		vblank_frequency            = other.vblank_frequency;
-		console_language            = other.console_language;
-		vulkan_validation_enabled   = other.vulkan_validation_enabled;
-		shader_validation_enabled   = other.shader_validation_enabled;
-		shader_optimization_type    = other.shader_optimization_type;
-		shader_log_direction        = other.shader_log_direction;
-		shader_log_folder           = other.shader_log_folder;
-		command_buffer_dump_enabled = other.command_buffer_dump_enabled;
-		command_buffer_dump_folder  = other.command_buffer_dump_folder;
-		printf_direction            = other.printf_direction;
-		printf_output_file          = other.printf_output_file;
-		profiler_direction          = other.profiler_direction;
-		renderdoc_enabled           = other.renderdoc_enabled;
+		screen_resolution               = other.screen_resolution;
+		fullscreen_enabled              = other.fullscreen_enabled;
+		present_mode                    = other.present_mode;
+		vblank_frequency                = other.vblank_frequency;
+		console_language                = other.console_language;
+		vulkan_validation_enabled       = other.vulkan_validation_enabled;
+		shader_validation_enabled       = other.shader_validation_enabled;
+		shader_optimization_type        = other.shader_optimization_type;
+		shader_log_direction            = other.shader_log_direction;
+		shader_log_folder               = other.shader_log_folder;
+		command_buffer_dump_enabled     = other.command_buffer_dump_enabled;
+		gpu_performance_metrics_enabled = other.gpu_performance_metrics_enabled;
+		command_buffer_dump_folder      = other.command_buffer_dump_folder;
+		printf_direction                = other.printf_direction;
+		printf_output_file              = other.printf_output_file;
+		profiler_direction              = other.profiler_direction;
+		renderdoc_enabled               = other.renderdoc_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -150,6 +157,7 @@ public:
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
 		KYTY_CFG_SET(fullscreen_enabled);
+		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -158,6 +166,7 @@ public:
 		KYTY_CFG_SET(shader_log_direction);
 		KYTY_CFG_SET(shader_log_folder);
 		KYTY_CFG_SET(command_buffer_dump_enabled);
+		KYTY_CFG_SET(gpu_performance_metrics_enabled);
 		KYTY_CFG_SET(command_buffer_dump_folder);
 		KYTY_CFG_SET(printf_direction);
 		KYTY_CFG_SET(printf_output_file);
@@ -177,6 +186,7 @@ public:
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
 		KYTY_CFG_GET(fullscreen_enabled);
+		KYTY_CFG_GET(present_mode);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -188,6 +198,8 @@ public:
 		KYTY_CFG_GET(shader_log_direction);
 		KYTY_CFG_GET(shader_log_folder);
 		KYTY_CFG_GET(command_buffer_dump_enabled);
+		gpu_performance_metrics_enabled =
+		    s->value("gpu_performance_metrics_enabled", gpu_performance_metrics_enabled).toBool();
 		KYTY_CFG_GET(command_buffer_dump_folder);
 		KYTY_CFG_GET(printf_direction);
 		KYTY_CFG_GET(printf_output_file);

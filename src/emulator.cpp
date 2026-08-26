@@ -177,6 +177,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+	Libs::Graphics::WindowSavePipelineCache();
 	std::quick_exit(0);
 }
 

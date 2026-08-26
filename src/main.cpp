@@ -48,6 +48,7 @@ static void PrintUsage() {
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --present-mode <value>               Fifo, Mailbox, FifoRelaxed, or Immediate.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -60,6 +61,7 @@ static void PrintUsage() {
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
+	::printf("  --gpu-performance-metrics <t|f>      Show Vulkan submit/wait metrics in title.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File. Default: Silent.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
@@ -220,6 +222,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {
 			options.config.screen_height = static_cast<uint32_t>(Common::ToInt32(value));
+		} else if (arg == "--present-mode") {
+			if (!ParseEnum(value, options.config.present_mode)) {
+				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--vblank-frequency") {
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
@@ -265,6 +272,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.command_buffer_dump_folder = value;
 		} else if (arg == "--graphics-debug-dump") {
 			if (!ParseBool(value, options.config.graphics_debug_dump_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-performance-metrics") {
+			if (!ParseBool(value, options.config.gpu_performance_metrics_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

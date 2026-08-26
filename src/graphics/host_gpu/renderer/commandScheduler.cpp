@@ -11,7 +11,9 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 void CommandSlot::Reset() {
 	EXIT_IF(buffer == nullptr);
-	const auto result = buffer.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
+	// Retain the driver's command-buffer storage across frames. The pool is reused for the same
+	// workload and releases all resources when it is destroyed.
+	const auto result = buffer.reset(vk::CommandBufferResetFlags {});
 	if (result != vk::Result::eSuccess) {
 		EXIT("failed to reset Vulkan command buffer: %s (%d)\n", VulkanToString(result).c_str(),
 		     static_cast<int>(result));
@@ -373,6 +375,20 @@ uint64_t CommandScheduler::NextSubmitSequence() noexcept {
 	return m_submit_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+void CommandScheduler::RecordFenceWait(uint64_t performance_ticks) noexcept {
+	m_fence_waits.fetch_add(1, std::memory_order_relaxed);
+	m_fence_wait_ticks.fetch_add(performance_ticks, std::memory_order_relaxed);
+}
+
+CommandSchedulerStatistics CommandScheduler::GetStatistics() const noexcept {
+	return {
+	    .submissions                  = m_submit_sequence.load(std::memory_order_relaxed),
+	    .fence_waits                  = m_fence_waits.load(std::memory_order_relaxed),
+	    .fence_wait_performance_ticks = m_fence_wait_ticks.load(std::memory_order_relaxed),
+	    .command_buffers              = m_command_buffer_count.load(std::memory_order_relaxed),
+	};
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active() || static_cast<size_t>(m_current) >= m_buffers.size());
 }
@@ -422,6 +438,7 @@ size_t CommandScheduler::GrowCommandBuffers() {
 		m_buffers.emplace_back(std::make_unique<RenderCommandBuffer>(*this));
 		m_buffer_ticks.push_back(0);
 	}
+	m_command_buffer_count.fetch_add(CommandBufferGrowStep, std::memory_order_relaxed);
 	return first;
 }
 

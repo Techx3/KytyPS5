@@ -10,6 +10,7 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -97,9 +98,7 @@ struct PipelineRenderingState {
 
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics): m_graphics(graphics) {
-		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	}
+	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 
@@ -128,6 +127,7 @@ public:
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	                                       const HW::ComputeShaderInfo& cs_regs,
 	                                       std::span<const uint32_t>    cs_spirv);
+	void             Save();
 
 private:
 	struct GraphicsPipelineKey {
@@ -201,26 +201,32 @@ private:
 		}
 	};
 
-	GraphicContext& m_graphics;
+	GraphicContext&       m_graphics;
+	vk::PipelineCache     m_driver_cache = nullptr;
+	std::filesystem::path m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
 	                   GraphicsPipelineKeyHash>
 	    m_graphics_pipelines;
 	std::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>, ComputePipelineKeyHash>
 	              m_compute_pipelines;
 	Common::Mutex m_mutex;
+
+	void CreateDriverCache();
 };
 
 void LogPipelineTrace(const char* phase, uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0,
                       uint32_t ps_crc32);
 void CreatePipelineInternal(
-    GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
-    const PipelineRenderingState& rendering, const ShaderVertexInputInfo& vs_input_info,
-    std::span<const uint32_t> vs_shader, const ShaderPixelInputInfo* ps_input_info,
-    std::span<const uint32_t> ps_shader, const PipelineStaticParameters& static_params,
-    uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            std::span<const uint32_t>     cs_shader);
+    GraphicContext& graphics, vk::PipelineCache driver_cache,
+    PipelineCache::GraphicsPipeline& pipeline, const PipelineRenderingState& rendering,
+    const ShaderVertexInputInfo& vs_input_info, std::span<const uint32_t> vs_shader,
+    const ShaderPixelInputInfo* ps_input_info, std::span<const uint32_t> ps_shader,
+    const PipelineStaticParameters& static_params, uint32_t vs_hash0, uint32_t vs_crc32,
+    uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active);
+void CreatePipelineInternal(GraphicContext& graphics, vk::PipelineCache driver_cache,
+                            PipelineCache::ComputePipeline& pipeline,
+                            const ShaderComputeInputInfo&   input_info,
+                            std::span<const uint32_t>       cs_shader);
 
 } // namespace Libs::Graphics
 

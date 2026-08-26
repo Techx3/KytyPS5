@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -79,7 +80,7 @@ void CommandBuffer::Begin() const {
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.sType            = vk::StructureType::eCommandBufferBeginInfo;
 	begin_info.pNext            = nullptr;
-	begin_info.flags            = {};
+	begin_info.flags            = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	begin_info.pInheritanceInfo = nullptr;
 
 	auto result = buffer.begin(&begin_info);
@@ -179,8 +180,13 @@ void CommandBuffer::WaitForFenceOnly() {
 	if (!m_execute || m_fence_waited) {
 		return;
 	}
-	auto device = m_graphics.device;
-	auto result = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
+	auto       device        = m_graphics.device;
+	const bool collect_stats = Config::GpuPerformanceMetricsEnabled();
+	const auto wait_start = collect_stats ? Common::Timer::QueryPerformanceCounter() : uint64_t {0};
+	auto       result     = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
+	if (collect_stats) {
+		m_scheduler.RecordFenceWait(Common::Timer::QueryPerformanceCounter() - wait_start);
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkWaitForFences", result, m_slot->id, m_submit_seq, m_debug_op,
 		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,

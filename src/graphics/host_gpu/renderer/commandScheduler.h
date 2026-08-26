@@ -20,6 +20,13 @@
 
 namespace Libs::Graphics {
 
+struct CommandSchedulerStatistics {
+	uint64_t submissions                  = 0;
+	uint64_t fence_waits                  = 0;
+	uint64_t fence_wait_performance_ticks = 0;
+	uint64_t command_buffers              = 0;
+};
+
 struct CommandSlot {
 	Common::Mutex*    pool_mutex = nullptr;
 	uint32_t          id         = 0;
@@ -63,6 +70,7 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	[[nodiscard]] CommandSchedulerStatistics GetStatistics() const noexcept;
 
 private:
 	static constexpr size_t CommandBufferGrowStep = 4;
@@ -103,6 +111,7 @@ private:
 	void                       RunOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] CommandSlot* AllocateCommandBuffer();
 	[[nodiscard]] uint64_t     NextSubmitSequence() noexcept;
+	void                       RecordFenceWait(uint64_t performance_ticks) noexcept;
 
 	MasterSemaphore                                   m_master;
 	RenderContext&                                    m_context;
@@ -124,6 +133,9 @@ private:
 	HW::UserConfig*                                   m_user_config          = nullptr;
 	HW::Shader*                                       m_shaders              = nullptr;
 	std::atomic<uint64_t>                             m_submit_sequence      = 0;
+	std::atomic<uint64_t>                             m_fence_waits          = 0;
+	std::atomic<uint64_t>                             m_fence_wait_ticks     = 0;
+	std::atomic<uint64_t>                             m_command_buffer_count = 0;
 
 	friend class CommandBuffer;
 };

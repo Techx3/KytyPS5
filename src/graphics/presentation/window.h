@@ -10,6 +10,7 @@ class Presenter;
 
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
 void                     WindowRun();
+void                     WindowSavePipelineCache();
 void                     WindowShutdown();
 
 } // namespace Libs::Graphics

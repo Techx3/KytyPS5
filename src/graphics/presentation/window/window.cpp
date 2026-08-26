@@ -29,6 +29,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/imeOverlay.h"
@@ -224,11 +225,9 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen =
-	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
-	const auto mode =
-	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const bool fullscreen = (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode       = fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
@@ -868,6 +867,12 @@ void WindowRun() {
 	g_window->Run();
 }
 
+void WindowSavePipelineCache() {
+	if (g_window != nullptr && g_window->render_context != nullptr) {
+		g_window->render_context->GetPipelineCache().Save();
+	}
+}
+
 void WindowShutdown() {
 	if (g_window != nullptr) {
 		g_window.reset();
@@ -959,10 +964,14 @@ void WindowContext::UpdateTitle() {
 	    Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id));
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t                   fps_start   = Common::Timer::QueryPerformanceCounter();
+	static uint64_t                   frame_num   = 0;
+	static uint64_t                   fps_frames  = 0;
+	static double                     current_fps = 0.0;
+	static CommandSchedulerStatistics previous_gpu_stats {};
+	static double                     submits_per_second = 0.0;
+	static double                     gpu_wait_ms        = 0.0;
+	static uint64_t                   command_buffers    = 0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -977,10 +986,22 @@ void WindowContext::UpdateTitle() {
 	frame_num++;
 	fps_frames++;
 	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+		const auto elapsed = now - fps_start;
+		current_fps        = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
+		                     static_cast<double>(elapsed);
+		if (Config::GpuPerformanceMetricsEnabled() && render_context != nullptr) {
+			const auto stats = render_context->GetCommandScheduler().GetStatistics();
+			submits_per_second =
+			    static_cast<double>(stats.submissions - previous_gpu_stats.submissions) *
+			    static_cast<double>(frequency) / static_cast<double>(elapsed);
+			gpu_wait_ms     = static_cast<double>(stats.fence_wait_performance_ticks -
+			                                      previous_gpu_stats.fence_wait_performance_ticks) *
+			                  1000.0 / static_cast<double>(frequency);
+			command_buffers = stats.command_buffers;
+			previous_gpu_stats = stats;
+		}
+		fps_start  = now;
+		fps_frames = 0;
 	}
 
 	auto fps = fmt::format(
@@ -988,6 +1009,10 @@ void WindowContext::UpdateTitle() {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	if (Config::GpuPerformanceMetricsEnabled()) {
+		fps += fmt::format(", submits/s: {:.1f}, fence wait: {:.2f} ms, cmd buffers: {}",
+		                   submits_per_second, gpu_wait_ms, command_buffers);
+	}
 
 #if defined(__APPLE__)
 	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.

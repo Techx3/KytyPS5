@@ -572,11 +572,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
-	state.width                 = std::numeric_limits<uint32_t>::max();
-	state.height                = std::numeric_limits<uint32_t>::max();
-	state.num_layers            = std::numeric_limits<uint32_t>::max();
-	state.num_color_attachments = color_count;
-	uint32_t attachment_samples = 0;
+	state.width                        = std::numeric_limits<uint32_t>::max();
+	state.height                       = std::numeric_limits<uint32_t>::max();
+	state.num_layers                   = std::numeric_limits<uint32_t>::max();
+	state.num_color_attachments        = color_count;
+	uint32_t        attachment_samples = 0;
+	Image::Barriers attachment_barriers;
+	attachment_barriers.reserve(color_count + (depth.image_id ? 1u : 0u));
+	const auto AppendBarriers = [&attachment_barriers](Image::Barriers&& barriers) {
+		attachment_barriers.insert(attachment_barriers.end(),
+		                           std::make_move_iterator(barriers.begin()),
+		                           std::make_move_iterator(barriers.end()));
+	};
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
@@ -610,12 +617,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
-		image.Transit(layout,
-		              vk::AccessFlagBits2::eColorAttachmentRead |
-		                  vk::AccessFlagBits2::eColorAttachmentWrite,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		const auto  access =
+		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+		AppendBarriers(
+		    image.GetBarriers(layout, access, Image::DestinationStages(access),
+		                      ImageSubresourceRange {view.base_level, view.level_count,
+		                                             view.base_layer, view.layer_count}));
 		state.width             = std::min(state.width, target.extent.width);
 		state.height            = std::min(state.height, target.extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
@@ -671,10 +678,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			access |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		}
 		const auto& view = depth.desc.view_info;
-		image.Transit(layout, access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		AppendBarriers(
+		    image.GetBarriers(layout, access, Image::DestinationStages(access),
+		                      ImageSubresourceRange {view.base_level, view.level_count,
+		                                             view.base_layer, view.layer_count}));
 		state.width               = std::min(state.width, depth.width);
 		state.height              = std::min(state.height, depth.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -688,6 +695,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
+	}
+	if (!attachment_barriers.empty()) {
+		buffer.EndRendering();
+		vk::DependencyInfo dependency {};
+		dependency.dependencyFlags         = vk::DependencyFlagBits::eByRegion;
+		dependency.imageMemoryBarrierCount = static_cast<uint32_t>(attachment_barriers.size());
+		dependency.pImageMemoryBarriers    = attachment_barriers.data();
+		buffer.Handle().pipelineBarrier2(dependency);
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;

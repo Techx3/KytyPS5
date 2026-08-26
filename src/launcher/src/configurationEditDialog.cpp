@@ -153,7 +153,9 @@ static void ListInit(QComboBox* combo, T value) {
 
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
+	m_ui->checkBox_gpu_performance_metrics->setChecked(info.gpu_performance_metrics_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -285,12 +287,15 @@ void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
-	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
-	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
-	info.console_language          = ui.comboBox_console_language->currentIndex();
-	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
-	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
-	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
+	info.present_mode =
+	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.fullscreen_enabled              = ui.checkBox_fullscreen->isChecked();
+	info.gpu_performance_metrics_enabled = ui.checkBox_gpu_performance_metrics->isChecked();
+	info.vblank_frequency                = ui.spinBox_vblank_frequency->value();
+	info.console_language                = ui.comboBox_console_language->currentIndex();
+	info.vulkan_validation_enabled       = ui.checkBox_vulkan_validation->isChecked();
+	info.shader_validation_enabled       = ui.checkBox_shader_validation->isChecked();
+	info.renderdoc_enabled               = ui.checkBox_renderdoc_capture->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif

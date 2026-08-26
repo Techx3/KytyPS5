@@ -144,6 +144,27 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	return static_cast<uint32_t>(-1);
 }
 
+static void LogAsyncComputeCapability(vk::PhysicalDevice device, uint32_t universal_family) {
+	auto     families                 = device.getQueueFamilyProperties();
+	uint32_t dedicated_compute_family = static_cast<uint32_t>(-1);
+	for (uint32_t family = 0; family < families.size(); family++) {
+		const auto flags = families[family].queueFlags;
+		if (families[family].queueCount != 0 && flags & vk::QueueFlagBits::eCompute &&
+		    !(flags & vk::QueueFlagBits::eGraphics)) {
+			dedicated_compute_family = family;
+			break;
+		}
+	}
+	const bool second_universal_queue =
+	    universal_family < families.size() && families[universal_family].queueCount > 1;
+	LOGF("Vulkan async compute capability: dedicated_family=%s, second_universal_queue=%s, "
+	     "enabled=false (guest graphics stream is ordered)\n",
+	     dedicated_compute_family != static_cast<uint32_t>(-1)
+	         ? std::to_string(dedicated_compute_family).c_str()
+	         : "none",
+	     second_universal_queue ? "true" : "false");
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
                                      const std::vector<const char*>& device_extensions,
@@ -496,8 +517,7 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	graphics.compute_subgroup_size_control_enabled =
 	    features13.subgroupSizeControl == VK_TRUE &&
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
-	    subgroup_size_control.minSubgroupSize <= 64 &&
-	    subgroup_size_control.maxSubgroupSize >= 64;
+	    subgroup_size_control.minSubgroupSize <= 64 && subgroup_size_control.maxSubgroupSize >= 64;
 	graphics.compute_wave64_supported =
 	    graphics.subgroup_size == 64u || graphics.compute_subgroup_size_control_enabled;
 
@@ -650,9 +670,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	const bool subgroup_size_control_enabled =
-	    graphics.compute_subgroup_size_control_enabled &&
-	    supported_features13.subgroupSizeControl == VK_TRUE;
+	const bool subgroup_size_control_enabled = graphics.compute_subgroup_size_control_enabled &&
+	                                           supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
 #if defined(__APPLE__)
@@ -1026,6 +1045,7 @@ void WindowContext::CreateVulkan() {
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
+	LogAsyncComputeCapability(graphic_ctx.physical_device, queue_family);
 
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(

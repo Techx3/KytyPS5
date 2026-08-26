@@ -37,6 +37,10 @@ bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }
 
+PresentMode GetPresentMode() {
+	return g_config->present_mode;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
@@ -75,6 +79,10 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 
 bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
+}
+
+bool GpuPerformanceMetricsEnabled() {
+	return g_config->gpu_performance_metrics_enabled;
 }
 
 OutputDirection GetPrintfDirection() {
