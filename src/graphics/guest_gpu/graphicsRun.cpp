@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pm4Inspector.h"
+#include "graphics/guest_gpu/resourceRegistry.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -111,7 +112,9 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer);
 	if (Config::CommandBufferDumpEnabled()) {
 		m_pm4_inspector = std::make_unique<Pm4::SubmissionInspector>(
-		    Config::GetCommandBufferDumpFolder(), ReadGuestWordsForInspector);
+		    Config::GetCommandBufferDumpFolder(), ReadGuestWordsForInspector,
+		    Pm4::InspectionLimits {},
+		    [] { return ResourceRegistration::GetRegistry().GetSnapshot(); });
 	}
 	m_thread = std::jthread(ThreadRun, this);
 }

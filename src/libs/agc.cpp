@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/resourceRegistry.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1708,59 +1709,76 @@ static std::mutex g_workload_stream_mutex;
 static uint32_t   g_workload_stream_mask = 0;
 static uint8_t    g_workload_streams[WORKLOAD_STREAM_MAX_ID + 1][WORKLOAD_STREAM_RECORD_SIZE] {};
 
-uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner() {
+int KYTY_SYSV_ABI AgcDriverGetDefaultOwner(uint32_t* owner_handle) {
 	PRINT_NAME();
 
-	return 0x8a6c9018u;
+	return ResourceRegistration::GetRegistry().GetDefaultOwner(owner_handle)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength() {
+int KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength(uint32_t* max_name_length) {
 	PRINT_NAME();
 
-	return 0x8a6c9018u;
+	return ResourceRegistration::GetRegistry().GetMaxNameLength(max_name_length)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDriverInitResourceRegistration() {
+int KYTY_SYSV_ABI AgcDriverInitResourceRegistration(void* memory, size_t size_in_bytes,
+                                                    uint32_t max_name_length) {
 	PRINT_NAME();
 
-	return 0x8a6c9018u;
+	return ResourceRegistration::GetRegistry().Initialize(memory, size_in_bytes, max_name_length)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 }
 
-uint32_t KYTY_SYSV_ABI
-AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes) {
+int KYTY_SYSV_ABI AgcDriverQueryResourceRegistrationUserMemoryRequirements(
+    size_t* size_in_bytes, uint32_t max_owners_and_resources, uint32_t max_name_length) {
 	PRINT_NAME();
 
-	if (size_in_bytes != nullptr) {
-		*size_in_bytes = 0;
-	}
-
-	return 0x8a6c9018u;
+	return ResourceRegistration::Registry::QueryMemoryRequirement(
+	           size_in_bytes, max_owners_and_resources, max_name_length)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterOwner() {
+int KYTY_SYSV_ABI AgcDriverRegisterOwner(uint32_t* owner_handle, const char* owner_name) {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	return ResourceRegistration::GetRegistry().RegisterOwner(owner_handle, owner_name)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterResource() {
+int KYTY_SYSV_ABI AgcDriverRegisterResource(uint32_t* resource_handle, uint32_t owner_handle,
+                                            const void* memory, size_t size_in_bytes,
+                                            const char* resource_name, uint32_t resource_type,
+                                            uint64_t user_data) {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	return ResourceRegistration::GetRegistry().RegisterResource(
+	           resource_handle, owner_handle, memory, size_in_bytes, resource_name, resource_type,
+	           user_data)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 }
 
 int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
 	PRINT_NAME();
 
-	(void)owner_handle;
-
-	return static_cast<int>(0x8a6c9018u);
+	return ResourceRegistration::GetRegistry().UnregisterOwnerAndResources(owner_handle)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
 }
 
-int KYTY_SYSV_ABI AgcDriverUnregisterResource() {
+int KYTY_SYSV_ABI AgcDriverUnregisterResource(uint32_t resource_handle) {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	return ResourceRegistration::GetRegistry().UnregisterResource(resource_handle)
+	           ? OK
+	           : GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
 }
 
 int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {

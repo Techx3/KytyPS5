@@ -475,6 +475,8 @@ add_executable(pm4_inspector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/Pm4InspectorTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/pm4.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/pm4Inspector.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/resourceRegistry.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.cpp"
 )
 target_link_libraries(pm4_inspector_tests common fmt::fmt nlohmann_json::nlohmann_json)
 target_include_directories(pm4_inspector_tests PRIVATE ${inc_headers})

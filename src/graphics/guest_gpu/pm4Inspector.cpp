@@ -2,11 +2,13 @@
 
 #include "common/file.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
 #include <fmt/format.h>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -56,6 +58,44 @@ std::string WordText(uint32_t value) {
 	return fmt::format("0x{:08x}", value);
 }
 
+uint64_t SaturatingEnd(uint64_t address, uint64_t size) {
+	return size > std::numeric_limits<uint64_t>::max() - address
+	           ? std::numeric_limits<uint64_t>::max()
+	           : address + size;
+}
+
+std::vector<ResourceAnnotation> FindResources(const ResourceRegistration::Snapshot& snapshot,
+                                              uint64_t address, uint64_t size_bytes) {
+	std::vector<ResourceAnnotation> result;
+	const uint64_t query_end = SaturatingEnd(address, std::max<uint64_t>(size_bytes, 1));
+	for (const auto& resource: snapshot.resources) {
+		const uint64_t resource_end = SaturatingEnd(resource.address, resource.size_bytes);
+		if (address >= resource_end || resource.address >= query_end) {
+			continue;
+		}
+		ResourceAnnotation annotation;
+		annotation.handle       = resource.handle;
+		annotation.owner_handle = resource.owner_handle;
+		annotation.type         = resource.type;
+		annotation.base_address = resource.address;
+		annotation.size_bytes   = resource.size_bytes;
+		annotation.offset_bytes = address >= resource.address ? address - resource.address : 0;
+		annotation.name         = resource.name;
+		result.push_back(std::move(annotation));
+	}
+	return result;
+}
+
+const char* DescriptorKindName(ResourceDescriptorType kind) {
+	switch (kind) {
+		case ResourceDescriptorType::Texture: return "texture";
+		case ResourceDescriptorType::Buffer: return "buffer";
+		case ResourceDescriptorType::Sampler: return "sampler";
+		case ResourceDescriptorType::Unused: return "unused";
+	}
+	return "unknown";
+}
+
 void HashWord(uint64_t* hash, uint32_t value) {
 	constexpr uint64_t FnvPrime = 1099511628211ull;
 	for (uint32_t shift = 0; shift < 32; shift += 8) {
@@ -67,11 +107,57 @@ void HashWord(uint64_t* hash, uint32_t value) {
 class Parser final {
 public:
 	Parser(SubmissionInspection* result, QueueRegisterState* state, const MemoryReader& reader,
-	       const InspectionLimits& limits)
-	    : m_result(result), m_state(state), m_reader(reader), m_limits(limits) {}
+	       const InspectionLimits& limits, const ResourceRegistration::Snapshot& resources)
+	    : m_result(result), m_state(state), m_reader(reader), m_limits(limits),
+	      m_resources(resources) {}
 
 	void AddRoot(const char* role, uint64_t address, std::span<const uint32_t> words) {
 		AddBuffer(role, address, words, 0);
+	}
+
+	void CaptureDescriptors() {
+		struct Range {
+			const char* name;
+			uint32_t    first;
+			uint32_t    last;
+		};
+		constexpr Range ranges[] = {
+		    {"pixel", SPI_SHADER_USER_DATA_PS_0, SPI_SHADER_USER_DATA_PS_31},
+		    {"geometry", SPI_SHADER_USER_DATA_GS_0, SPI_SHADER_USER_DATA_GS_31},
+		    {"export", SPI_SHADER_USER_DATA_ES_0, SPI_SHADER_USER_DATA_ES_31},
+		    {"hull", SPI_SHADER_USER_DATA_HS_0, SPI_SHADER_USER_DATA_HS_31},
+		    {"compute", COMPUTE_USER_DATA_0, COMPUTE_USER_DATA_15}};
+		const auto& registers = m_state->Entries(RegisterSpace::Shader);
+		std::set<std::pair<std::string, uint64_t>> seen;
+		for (const auto& range: ranges) {
+			for (uint32_t offset = range.first; offset < range.last; offset++) {
+				const auto lo = registers.find(offset);
+				const auto hi = registers.find(offset + 1u);
+				if (lo == registers.end() || hi == registers.end()) {
+					continue;
+				}
+				const uint64_t address = (static_cast<uint64_t>(lo->second) |
+				                          (static_cast<uint64_t>(hi->second & 0xffffu) << 32u));
+				if (address < 0x10000u || (address & 3u) != 0 ||
+				    !seen.emplace(range.name, address).second) {
+					continue;
+				}
+				std::vector<uint32_t> words;
+				std::string           note;
+				if (!ReadMemory(address, 8, &words, &note)) {
+					continue;
+				}
+				DescriptorInspection descriptor;
+				descriptor.stage           = range.name;
+				descriptor.source_register = offset;
+				descriptor.address         = address;
+				descriptor.words           = std::move(words);
+				descriptor.kind =
+				    DescriptorKindName(ShaderClassifyResourceDescriptor(descriptor.words.data()));
+				descriptor.resources = FindResources(m_resources, address, 8 * sizeof(uint32_t));
+				m_result->descriptors.push_back(std::move(descriptor));
+			}
+		}
 	}
 
 private:
@@ -84,7 +170,9 @@ private:
 		buffer.declared_size_dw = static_cast<uint32_t>(words.size());
 		buffer.depth            = depth;
 		buffer.words.assign(words.begin(), words.end());
-		const size_t id = buffer.id;
+		buffer.resources = FindResources(m_resources, address,
+		                                 static_cast<uint64_t>(words.size()) * sizeof(uint32_t));
+		const size_t id  = buffer.id;
 		m_result->buffers.push_back(std::move(buffer));
 		m_buffer_ids.emplace(std::make_pair(address, static_cast<uint32_t>(words.size())), id);
 		ParseBuffer(id);
@@ -122,6 +210,8 @@ private:
 		reference.kind    = kind;
 		reference.address = address;
 		reference.size_dw = size_dw;
+		reference.resources =
+		    FindResources(m_resources, address, static_cast<uint64_t>(size_dw) * sizeof(uint32_t));
 		if (address == 0 && size_dw != 0) {
 			reference.note = "null address";
 			return reference;
@@ -137,6 +227,8 @@ private:
 		reference.kind    = MemoryReferenceKind::CommandBuffer;
 		reference.address = address;
 		reference.size_dw = size_dw;
+		reference.resources =
+		    FindResources(m_resources, address, static_cast<uint64_t>(size_dw) * sizeof(uint32_t));
 		if (size_dw == 0) {
 			reference.snapshot_status = InspectionStatus::Known;
 			reference.note            = "empty command buffer";
@@ -354,6 +446,7 @@ private:
 	QueueRegisterState*                             m_state;
 	const MemoryReader&                             m_reader;
 	InspectionLimits                                m_limits;
+	const ResourceRegistration::Snapshot&           m_resources;
 	uint32_t                                        m_snapshot_dw = 0;
 	std::map<std::pair<uint64_t, uint32_t>, size_t> m_buffer_ids;
 };
@@ -363,6 +456,68 @@ nlohmann::json StateToJson(const StateView& state) {
 	        {"shader_registers", state.shader_registers},
 	        {"uconfig_registers", state.uconfig_registers},
 	        {"hash", AddressText(state.hash)}};
+}
+
+nlohmann::json ResourceAnnotationToJson(const ResourceAnnotation& resource) {
+	return {{"handle", resource.handle},
+	        {"owner_handle", resource.owner_handle},
+	        {"type", resource.type},
+	        {"type_name", ResourceRegistration::ResourceTypeName(resource.type)},
+	        {"name", resource.name},
+	        {"base_address", AddressText(resource.base_address)},
+	        {"size_bytes", resource.size_bytes},
+	        {"offset_bytes", resource.offset_bytes}};
+}
+
+uint64_t WordsHash(std::span<const uint32_t> words) {
+	uint64_t hash = 14695981039346656037ull;
+	for (const auto word: words) {
+		HashWord(&hash, word);
+	}
+	return hash;
+}
+
+std::vector<std::string> PacketSignatures(const SubmissionInspection& inspection) {
+	std::vector<std::string> result;
+	for (const auto& buffer: inspection.buffers) {
+		for (const auto& packet: buffer.packets) {
+			result.push_back(fmt::format("{}@{}:{}:{}:{}:{}:{}", buffer.role, packet.offset_dw,
+			                             packet.name, InspectionStatusName(packet.status),
+			                             packet.size_dw, packet.custom_opcode,
+			                             AddressText(WordsHash(packet.payload))));
+		}
+	}
+	std::sort(result.begin(), result.end());
+	return result;
+}
+
+std::vector<std::string> DescriptorSignatures(const SubmissionInspection& inspection) {
+	std::vector<std::string> result;
+	for (const auto& descriptor: inspection.descriptors) {
+		result.push_back(fmt::format(
+		    "{}:0x{:x}:{}:{}:{}", descriptor.stage, descriptor.source_register, descriptor.kind,
+		    AddressText(descriptor.address), AddressText(WordsHash(descriptor.words))));
+	}
+	std::sort(result.begin(), result.end());
+	return result;
+}
+
+std::vector<std::string> ResourceSignatures(const SubmissionInspection& inspection) {
+	std::vector<std::string> result;
+	for (const auto& resource: inspection.registered_resources.resources) {
+		result.push_back(fmt::format("{}:{}:{}:{}:{}:{}", resource.handle, resource.owner_handle,
+		                             resource.type, AddressText(resource.address),
+		                             resource.size_bytes, resource.name));
+	}
+	std::sort(result.begin(), result.end());
+	return result;
+}
+
+std::vector<std::string> Difference(const std::vector<std::string>& lhs,
+                                    const std::vector<std::string>& rhs) {
+	std::vector<std::string> result;
+	std::set_difference(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(), std::back_inserter(result));
+	return result;
 }
 
 } // namespace
@@ -414,6 +569,10 @@ std::optional<uint32_t> QueueRegisterState::Get(RegisterSpace space, uint32_t of
 	return value == registers.end() ? std::nullopt : std::optional<uint32_t>(value->second);
 }
 
+const std::map<uint32_t, uint32_t>& QueueRegisterState::Entries(RegisterSpace space) const {
+	return Select(space);
+}
+
 StateView QueueRegisterState::View() const {
 	StateView view;
 	view.context_registers = static_cast<uint32_t>(m_context.size());
@@ -437,23 +596,46 @@ StateView QueueRegisterState::View() const {
 SubmissionInspection InspectSubmission(const SubmissionMetadata& metadata, const char* root_role,
                                        uint64_t root_address, std::span<const uint32_t> root_words,
                                        QueueRegisterState* state, const MemoryReader& reader,
-                                       const InspectionLimits& limits) {
+                                       const InspectionLimits&               limits,
+                                       const ResourceRegistration::Snapshot& resources) {
 	SubmissionInspection result;
-	result.metadata           = metadata;
-	result.state_before_reset = state->View();
+	result.metadata             = metadata;
+	result.registered_resources = resources;
+	result.state_before_reset   = state->View();
 	if (metadata.reset_state) {
 		state->Reset();
 	}
 	result.state_at_submit = state->View();
-	Parser parser(&result, state, reader, limits);
+	Parser parser(&result, state, reader, limits, resources);
 	parser.AddRoot(root_role, root_address, root_words);
+	parser.CaptureDescriptors();
 	result.state_after = state->View();
+	return result;
+}
+
+SubmissionInspection::Comparison CompareSubmissionInspections(const SubmissionInspection& previous,
+                                                              const SubmissionInspection& current) {
+	SubmissionInspection::Comparison result;
+	result.previous_capture_id      = previous.metadata.capture_id;
+	result.state_changed            = previous.state_after.hash != current.state_after.hash;
+	const auto previous_packets     = PacketSignatures(previous);
+	const auto current_packets      = PacketSignatures(current);
+	result.added_packets            = Difference(current_packets, previous_packets);
+	result.removed_packets          = Difference(previous_packets, current_packets);
+	const auto previous_descriptors = DescriptorSignatures(previous);
+	const auto current_descriptors  = DescriptorSignatures(current);
+	result.added_descriptors        = Difference(current_descriptors, previous_descriptors);
+	result.removed_descriptors      = Difference(previous_descriptors, current_descriptors);
+	const auto previous_resources   = ResourceSignatures(previous);
+	const auto current_resources    = ResourceSignatures(current);
+	result.added_resources          = Difference(current_resources, previous_resources);
+	result.removed_resources        = Difference(previous_resources, current_resources);
 	return result;
 }
 
 std::string SerializeSubmissionInspection(const SubmissionInspection& inspection) {
 	nlohmann::json root;
-	root["schema"]                 = "kyty.pm4.submission.v1";
+	root["schema"]                 = "kyty.pm4.submission.v2";
 	root["capture"]                = {{"id", inspection.metadata.capture_id},
 	                                  {"frame", inspection.metadata.frame},
 	                                  {"queue", inspection.metadata.queue},
@@ -465,9 +647,59 @@ std::string SerializeSubmissionInspection(const SubmissionInspection& inspection
 	root["capture_scope"]          = {
 	    {"command_buffers", "root and readable nested indirect buffers"},
 	    {"indirect_registers", "readable register-pair arrays"},
-	    {"resource_registration_map", "not available"},
-	    {"descriptor_memory", "not yet captured unless encoded as an inspected reference"},
+	    {"resource_registration_map", inspection.registered_resources.initialized
+	                                      ? "captured from local libSceAgc resource registration"
+	                                      : "available; resource registration was not initialized"},
+	    {"descriptor_memory", "inferred snapshots from readable shader user-data address pairs"},
 	    {"classification", "packet structure, not a claim of complete runtime support"}};
+
+	root["resource_registration"] = {
+	    {"initialized", inspection.registered_resources.initialized},
+	    {"max_name_length", inspection.registered_resources.max_name_length},
+	    {"owners", nlohmann::json::array()},
+	    {"resources", nlohmann::json::array()}};
+	for (const auto& owner: inspection.registered_resources.owners) {
+		root["resource_registration"]["owners"].push_back(
+		    {{"handle", owner.handle}, {"name", owner.name}});
+	}
+	for (const auto& resource: inspection.registered_resources.resources) {
+		root["resource_registration"]["resources"].push_back(
+		    {{"handle", resource.handle},
+		     {"owner_handle", resource.owner_handle},
+		     {"address", AddressText(resource.address)},
+		     {"size_bytes", resource.size_bytes},
+		     {"type", resource.type},
+		     {"type_name", ResourceRegistration::ResourceTypeName(resource.type)},
+		     {"user_data", AddressText(resource.user_data)},
+		     {"name", resource.name}});
+	}
+
+	root["descriptors"] = nlohmann::json::array();
+	for (const auto& descriptor: inspection.descriptors) {
+		nlohmann::json descriptor_json = {{"stage", descriptor.stage},
+		                                  {"source_register", WordText(descriptor.source_register)},
+		                                  {"address", AddressText(descriptor.address)},
+		                                  {"status", InspectionStatusName(descriptor.status)},
+		                                  {"kind", descriptor.kind},
+		                                  {"words", descriptor.words},
+		                                  {"resources", nlohmann::json::array()}};
+		for (const auto& resource: descriptor.resources) {
+			descriptor_json["resources"].push_back(ResourceAnnotationToJson(resource));
+		}
+		root["descriptors"].push_back(std::move(descriptor_json));
+	}
+
+	if (inspection.comparison.has_value()) {
+		const auto& comparison         = *inspection.comparison;
+		root["comparison_to_previous"] = {{"previous_capture_id", comparison.previous_capture_id},
+		                                  {"state_changed", comparison.state_changed},
+		                                  {"added_packets", comparison.added_packets},
+		                                  {"removed_packets", comparison.removed_packets},
+		                                  {"added_descriptors", comparison.added_descriptors},
+		                                  {"removed_descriptors", comparison.removed_descriptors},
+		                                  {"added_resources", comparison.added_resources},
+		                                  {"removed_resources", comparison.removed_resources}};
+	}
 
 	nlohmann::json summary = nlohmann::json::object();
 	for (size_t index = 0; index < static_cast<size_t>(InspectionStatus::Count); index++) {
@@ -484,7 +716,11 @@ std::string SerializeSubmissionInspection(const SubmissionInspection& inspection
 		                              {"declared_size_dw", buffer.declared_size_dw},
 		                              {"depth", buffer.depth},
 		                              {"words", buffer.words},
+		                              {"resources", nlohmann::json::array()},
 		                              {"packets", nlohmann::json::array()}};
+		for (const auto& resource: buffer.resources) {
+			buffer_json["resources"].push_back(ResourceAnnotationToJson(resource));
+		}
 		for (const auto& packet: buffer.packets) {
 			nlohmann::json packet_json = {{"offset_dw", packet.offset_dw},
 			                              {"size_dw", packet.size_dw},
@@ -521,6 +757,10 @@ std::string SerializeSubmissionInspection(const SubmissionInspection& inspection
 				if (!reference.snapshot_words.empty()) {
 					reference_json["snapshot_words"] = reference.snapshot_words;
 				}
+				reference_json["resources"] = nlohmann::json::array();
+				for (const auto& resource: reference.resources) {
+					reference_json["resources"].push_back(ResourceAnnotationToJson(resource));
+				}
 				packet_json["references"].push_back(std::move(reference_json));
 			}
 			buffer_json["packets"].push_back(std::move(packet_json));
@@ -531,8 +771,10 @@ std::string SerializeSubmissionInspection(const SubmissionInspection& inspection
 }
 
 SubmissionInspector::SubmissionInspector(std::filesystem::path folder, MemoryReader reader,
-                                         InspectionLimits limits)
-    : m_folder(std::move(folder)), m_reader(std::move(reader)), m_limits(limits) {}
+                                         InspectionLimits         limits,
+                                         ResourceSnapshotProvider resource_provider)
+    : m_folder(std::move(folder)), m_reader(std::move(reader)), m_limits(limits),
+      m_resource_provider(std::move(resource_provider)) {}
 
 bool SubmissionInspector::CaptureGraphics(uint32_t frame, bool reset_state, uint64_t dcb_address,
                                           std::span<const uint32_t> dcb_words) {
@@ -556,9 +798,15 @@ bool SubmissionInspector::Capture(SubmissionQueueKind queue_kind, uint32_t frame
 	metadata.queue       = queue;
 	metadata.queue_kind  = queue_kind;
 	metadata.reset_state = reset_state;
-	auto inspection      = InspectSubmission(metadata, role, address, words, &m_queue_states[queue],
-	                                         m_reader, m_limits);
-	auto json            = SerializeSubmissionInspection(inspection);
+	const auto resources =
+	    m_resource_provider != nullptr ? m_resource_provider() : ResourceRegistration::Snapshot {};
+	auto inspection = InspectSubmission(metadata, role, address, words, &m_queue_states[queue],
+	                                    m_reader, m_limits, resources);
+	if (const auto previous = m_previous_inspections.find(queue);
+	    previous != m_previous_inspections.end()) {
+		inspection.comparison = CompareSubmissionInspections(previous->second, inspection);
+	}
+	auto json = SerializeSubmissionInspection(inspection);
 	auto path = m_folder / fmt::format("{:06d}_f{:05d}_q{:02x}_{}.json", metadata.capture_id, frame,
 	                                   queue, role);
 	Common::File::CreateDirectories(path.parent_path());
@@ -569,6 +817,7 @@ bool SubmissionInspector::Capture(SubmissionQueueKind queue_kind, uint32_t frame
 	}
 	file.Write(json.data(), static_cast<uint32_t>(json.size()));
 	file.Close();
+	m_previous_inspections[queue] = std::move(inspection);
 	return true;
 }
 

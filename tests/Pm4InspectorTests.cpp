@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pm4Inspector.h"
+#include "graphics/guest_gpu/resourceRegistry.h"
 
 #include <nlohmann/json.hpp>
 
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace {
@@ -20,6 +22,7 @@ using Libs::Graphics::Pm4::QueueRegisterState;
 using Libs::Graphics::Pm4::RegisterSpace;
 using Libs::Graphics::Pm4::SerializeSubmissionInspection;
 using Libs::Graphics::Pm4::SubmissionMetadata;
+namespace ResourceRegistration = Libs::Graphics::ResourceRegistration;
 
 void Check(bool value, const char *message) {
   if (!value) {
@@ -152,6 +155,85 @@ void TestMalformedAndUnknownPacketsRemainDiagnostic() {
         "unsupported packet type was misclassified");
 }
 
+void TestResourceRegistryAndAnnotations() {
+  ResourceRegistration::Registry registry;
+  size_t required = 0;
+  Check(
+      ResourceRegistration::Registry::QueryMemoryRequirement(&required, 8, 32),
+      "resource-registration memory requirement failed");
+  std::vector<uint8_t> memory(required);
+  Check(registry.Initialize(memory.data(), memory.size(), 32),
+        "resource registry did not initialize");
+
+  uint32_t owner = 0;
+  Check(registry.RegisterOwner(&owner, "Renderer"),
+        "resource owner was not registered");
+  uint32_t resource = 0;
+  Check(registry.RegisterResource(&resource, owner,
+                                  reinterpret_cast<const void *>(0x1000), 0x100,
+                                  "Main DCB", 14, 0x55),
+        "resource was not registered");
+
+  QueueRegisterState state;
+  const std::vector<uint32_t> commands = {0x80000000u};
+  const auto result = InspectSubmission(Metadata(), "dcb", 0x1040, commands,
+                                        &state, {}, {}, registry.GetSnapshot());
+  Check(result.buffers[0].resources.size() == 1 &&
+            result.buffers[0].resources[0].handle == resource &&
+            result.buffers[0].resources[0].offset_bytes == 0x40,
+        "command buffer was not resolved through the registration map");
+  Check(registry.UnregisterResource(resource) &&
+            registry.UnregisterOwnerAndResources(owner),
+        "registered resource or owner was not removed");
+}
+
+void TestDescriptorCapture() {
+  constexpr uint64_t descriptor_address = 0x00600000u;
+  const std::vector<uint32_t> descriptor(8, 0);
+  const MemoryReader reader = [&descriptor](uint64_t address, uint32_t size_dw,
+                                            std::vector<uint32_t> *words) {
+    if (address != descriptor_address || size_dw != descriptor.size()) {
+      return false;
+    }
+    *words = descriptor;
+    return true;
+  };
+  const std::vector<uint32_t> commands = {
+      KYTY_PM4(4, Libs::Graphics::Pm4::IT_SET_SH_REG, 0),
+      Libs::Graphics::Pm4::SPI_SHADER_USER_DATA_PS_0,
+      static_cast<uint32_t>(descriptor_address),
+      static_cast<uint32_t>(descriptor_address >> 32u),
+  };
+  QueueRegisterState state;
+  const auto result = InspectSubmission(Metadata(true), "dcb", 0x1000, commands,
+                                        &state, reader);
+  Check(result.descriptors.size() == 1 &&
+            result.descriptors[0].stage == "pixel" &&
+            result.descriptors[0].kind == "buffer" &&
+            result.descriptors[0].words == descriptor,
+        "shader user-data descriptor was not captured and classified");
+}
+
+void TestAutomaticComparison() {
+  QueueRegisterState first_state;
+  QueueRegisterState second_state;
+  const std::vector<uint32_t> first = {0x80000000u};
+  const std::vector<uint32_t> second = {KYTY_PM4(2, 0xfe, 0), 0};
+  auto first_metadata = Metadata();
+  auto second_metadata = Metadata();
+  second_metadata.capture_id = 18;
+  const auto previous =
+      InspectSubmission(first_metadata, "dcb", 0x1000, first, &first_state);
+  const auto current =
+      InspectSubmission(second_metadata, "dcb", 0x2000, second, &second_state);
+  const auto comparison =
+      Libs::Graphics::Pm4::CompareSubmissionInspections(previous, current);
+  Check(comparison.previous_capture_id == 17 &&
+            comparison.added_packets.size() == 1 &&
+            comparison.removed_packets.size() == 1,
+        "trace comparison did not report changed packet signatures");
+}
+
 void TestJsonSchema() {
   QueueRegisterState state;
   const std::vector<uint32_t> commands = {0x80000000u};
@@ -159,15 +241,15 @@ void TestJsonSchema() {
       InspectSubmission(Metadata(true), "dcb", 0x1234, commands, &state);
   const auto json =
       nlohmann::json::parse(SerializeSubmissionInspection(result));
-  Check(json.at("schema") == "kyty.pm4.submission.v1",
+  Check(json.at("schema") == "kyty.pm4.submission.v2",
         "JSON schema identifier is missing");
   Check(json.at("capture").at("queue_kind") == "graphics",
         "JSON queue kind is incorrect");
   Check(json.at("buffers").at(0).at("packets").at(0).at("status") == "Known",
         "JSON packet classification is incorrect");
-  Check(json.at("capture_scope").at("resource_registration_map") ==
-            "not available",
-        "JSON does not disclose the unavailable registration map");
+  Check(!json.at("resource_registration").at("initialized") &&
+            json.at("descriptors").is_array(),
+        "JSON does not expose resource and descriptor diagnostics");
 }
 
 } // namespace
@@ -177,6 +259,9 @@ int main() {
   TestIndirectCommandBufferSnapshot();
   TestIndirectRegisterSnapshot();
   TestMalformedAndUnknownPacketsRemainDiagnostic();
+  TestResourceRegistryAndAnnotations();
+  TestDescriptorCapture();
+  TestAutomaticComparison();
   TestJsonSchema();
   return 0;
 }
