@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pm4Inspector.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <cstdio>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -67,6 +69,35 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
 }
 
+static bool ReadGuestWordsForInspector(uint64_t address, uint32_t size_dw,
+	                                   std::vector<uint32_t>* words) {
+	EXIT_IF(words == nullptr);
+	words->clear();
+	if (size_dw == 0) {
+		return true;
+	}
+	constexpr uint32_t CpuReadProtection = 0x01u;
+	const uint64_t     size_bytes        = static_cast<uint64_t>(size_dw) * sizeof(uint32_t);
+	if (address == 0 || address > std::numeric_limits<uint64_t>::max() - size_bytes) {
+		return false;
+	}
+	const uint64_t end = address + size_bytes;
+	for (uint64_t cursor = address; cursor < end;) {
+		LibKernel::Memory::VirtualQueryInfo info {};
+		if (LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(cursor), 0, &info,
+		                                          sizeof(info)) != OK ||
+		    info.is_committed == 0 ||
+		    (static_cast<uint32_t>(info.protection) & CpuReadProtection) == 0 ||
+		    info.start > cursor || info.end <= cursor) {
+			return false;
+		}
+		cursor = std::min<uint64_t>(end, info.end);
+	}
+	const auto* first = reinterpret_cast<const uint32_t*>(address);
+	words->assign(first, first + size_dw);
+	return true;
+}
+
 GuestGpu::OwnedCmdBuffer::OwnedCmdBuffer(const uint32_t* data, uint32_t count) {
 	EXIT_IF(data == nullptr && count != 0);
 	if (count != 0) {
@@ -78,6 +109,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer);
+	if (Config::CommandBufferDumpEnabled()) {
+		m_pm4_inspector = std::make_unique<Pm4::SubmissionInspector>(
+		    Config::GetCommandBufferDumpFolder(), ReadGuestWordsForInspector);
+	}
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -163,7 +198,14 @@ void GuestGpu::Submit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t*
 	submission.constant_commands             = OwnedCmdBuffer(cmd_const_buffer, num_const_dw);
 	submission.trigger_agc_interrupt_on_done = trigger_agc_interrupt_on_done;
 	submission.reset_processor               = m_graphics_done;
-	m_graphics_done                          = false;
+	if (m_pm4_inspector != nullptr &&
+	    !m_pm4_inspector->CaptureGraphics(
+	        static_cast<uint32_t>(GetFrameNum()), submission.reset_processor,
+	        reinterpret_cast<uint64_t>(cmd_draw_buffer),
+	        {submission.commands.Data(), submission.commands.Size()})) {
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create PM4 submission inspection\n");
+	}
+	m_graphics_done = false;
 	Enqueue(std::move(submission));
 }
 
@@ -182,6 +224,12 @@ void GuestGpu::SubmitCompute(uint32_t queue, uint32_t* cmd_buffer, uint32_t num_
 	submission.queue_id                      = 1 + compute_queue;
 	submission.commands                      = OwnedCmdBuffer(cmd_buffer, num_dw);
 	submission.trigger_agc_interrupt_on_done = trigger_agc_interrupt_on_done;
+	if (m_pm4_inspector != nullptr &&
+	    !m_pm4_inspector->CaptureAsyncCompute(
+	        static_cast<uint32_t>(GetFrameNum()), queue, reinterpret_cast<uint64_t>(cmd_buffer),
+	        {submission.commands.Data(), submission.commands.Size()})) {
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create PM4 submission inspection\n");
+	}
 	Enqueue(std::move(submission));
 }
 

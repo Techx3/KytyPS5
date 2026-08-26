@@ -19,6 +19,9 @@
 namespace Libs::Graphics {
 
 class RenderContext;
+namespace Pm4 {
+class SubmissionInspector;
+}
 
 class GuestGpu final {
 public:
@@ -56,7 +59,8 @@ private:
 		[[nodiscard]] uint32_t Size() const noexcept {
 			return static_cast<uint32_t>(m_words.size());
 		}
-		[[nodiscard]] uint32_t* Data() noexcept { return m_words.data(); }
+		[[nodiscard]] uint32_t*       Data() noexcept { return m_words.data(); }
+		[[nodiscard]] const uint32_t* Data() const noexcept { return m_words.data(); }
 
 	private:
 		std::vector<uint32_t> m_words;
@@ -106,6 +110,7 @@ private:
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
+	std::unique_ptr<Pm4::SubmissionInspector>                        m_pm4_inspector;
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
