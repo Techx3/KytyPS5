@@ -753,8 +753,8 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
     if (opcode == 71u && count >= 4u && binary[i + 2] == 11u) {
       direct_builtins[binary[i + 1]] = binary[i + 3];
     } else if (opcode == 72u && count >= 5u && binary[i + 3] == 11u) {
-      const uint64_t key = (static_cast<uint64_t>(binary[i + 1]) << 32u) |
-                           binary[i + 2];
+      const uint64_t key =
+          (static_cast<uint64_t>(binary[i + 1]) << 32u) | binary[i + 2];
       member_builtins[key] = binary[i + 4];
     } else if (opcode == 32u && count == 4u) {
       pointer_pointees[binary[i + 1]] = binary[i + 3];
@@ -763,9 +763,9 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
     } else if (opcode == 59u && count >= 4u) {
       variable_types[binary[i + 2]] = binary[i + 1];
     } else if (opcode == 65u && count >= 5u) {
-      accesses[binary[i + 2]] =
-          {binary[i + 3], std::vector<uint32_t>(binary.begin() + i + 4,
-                                                binary.begin() + i + count)};
+      accesses[binary[i + 2]] = {
+          binary[i + 3], std::vector<uint32_t>(binary.begin() + i + 4,
+                                               binary.begin() + i + count)};
     } else if (opcode == 62u && count >= 3u) {
       stores.push_back(binary[i + 1]);
     }
@@ -804,8 +804,8 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
     if (pointee == pointer_pointees.end() || member == constants.end()) {
       continue;
     }
-    const uint64_t key = (static_cast<uint64_t>(pointee->second) << 32u) |
-                         member->second;
+    const uint64_t key =
+        (static_cast<uint64_t>(pointee->second) << 32u) | member->second;
     if (const auto decorated = member_builtins.find(key);
         decorated != member_builtins.end() && decorated->second == builtin) {
       elements.push_back(UINT32_MAX);
@@ -816,8 +816,7 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
 }
 
 bool SpirvBuiltInStoreUsesAndConstant(const std::vector<uint32_t> &binary,
-                                      uint32_t builtin,
-                                      uint32_t constant) {
+                                      uint32_t builtin, uint32_t constant) {
   std::unordered_set<uint32_t> variables;
   std::unordered_map<uint32_t, uint32_t> constants;
   std::unordered_map<uint32_t, std::array<uint32_t, 2>> bitwise_ands;
@@ -1560,6 +1559,24 @@ void TestNewShaderRecompilerSoppMarkers() {
       std::find(result.spirv.begin(), result.spirv.end(), 264u) !=
           result.spirv.end(),
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestGraphicsBarrierScope() {
+  const uint32_t shader[] = {
+      EncodeSopp(0x0a, 0), // s_barrier
+      EncodeSopp(0x01, 0), // s_endpgm
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  const auto spirv = DisassembleSpirvBinary(result.spirv);
+  Check(Common::ContainsStr(spirv,
+                            "OpControlBarrier %uint_3 %uint_3 %uint_72"),
+        "graphics s_barrier did not lower to subgroup scope and memory");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3302,6 +3319,151 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
   Check(SpirvContainsOpcode(result.spirv, 112),
         "captured SDWA byte conversion did not emit OpConvertUToF");
   CheckSpirvBinaryValidates(result.spirv);
+
+}
+
+void TestNewShaderRecompilerCapturedVop1SdwaFindFirstBitLow() {
+  const uint32_t shader[] = {
+      0x7e2074f9u,
+      0x00050602u, // v_ffbl_b32 v16, v2.word1 (CS 0x2089e3700)
+      EncodeExp0(0x00, 0x1), EncodeExp1(16, 0, 0, 0), EncodeSopp(0x01),
+  };
+
+  ShaderPixelInputInfo ps_info{};
+  ps_info.ps_system_input_base = 2;
+  ps_info.ps_pos_x = true;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.input_info.pixel = &ps_info;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_FFBL_B32 v16, v2.sdwa(sel=5,sext=0)"),
+        "captured V_FFBL_B32 SDWA instruction was not decoded");
+
+  size_t extracts = 0;
+  size_t finds = 0;
+  for (const auto *block : result.program.values->blocks) {
+    for (const auto &inst : *block) {
+      extracts += inst.GetOpcode() ==
+                  ShaderRecompiler::IR::ValueOpcode::BitFieldUExtract;
+      finds += inst.GetOpcode() ==
+               ShaderRecompiler::IR::ValueOpcode::FindILsb32;
+    }
+  }
+  Check(extracts != 0u && finds != 0u,
+        "captured SDWA word selection did not feed V_FFBL_B32 in typed IR");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "captured V_FFBL_B32 did not emit OpBitFieldUExtract");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCapturedVop1SdwaNotByte0() {
+  const uint32_t shader[] = {
+      0x7e046ef9u,
+      0x00000602u, // v_not_b32 v2, v2.byte0 (CS 0x2089e3700)
+      EncodeExp0(0x00, 0x1), EncodeExp1(2, 0, 0, 0), EncodeSopp(0x01),
+  };
+
+  ShaderPixelInputInfo ps_info{};
+  ps_info.ps_system_input_base = 2;
+  ps_info.ps_pos_x = true;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.input_info.pixel = &ps_info;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_NOT_B32 v2, v2.sdwa(sel=0,sext=0)"),
+        "captured V_NOT_B32 SDWA instruction was not decoded");
+
+  size_t extracts = 0;
+  size_t bitwise_nots = 0;
+  for (const auto *block : result.program.values->blocks) {
+    for (const auto &inst : *block) {
+      extracts += inst.GetOpcode() ==
+                  ShaderRecompiler::IR::ValueOpcode::BitFieldUExtract;
+      bitwise_nots += inst.GetOpcode() ==
+                      ShaderRecompiler::IR::ValueOpcode::BitwiseNot32;
+    }
+  }
+  Check(extracts != 0u && bitwise_nots != 0u,
+        "captured SDWA byte selection did not feed V_NOT_B32 in typed IR");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "captured V_NOT_B32 did not emit OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "captured V_NOT_B32 did not emit OpNot");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCapturedVop2SdwaByteShift() {
+  const uint32_t shader[] = {
+      0x2c0910f9u,
+      0x86000613u, // v_lshrrev_b32 v4, v19.byte0, 8 (CS 0x208a83f00)
+      EncodeExp0(0x00, 0x1), EncodeExp1(4, 0, 0, 0), EncodeSopp(0x01),
+  };
+
+  ShaderPixelInputInfo ps_info{};
+  ps_info.ps_system_input_base = 19;
+  ps_info.ps_pos_x = true;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.input_info.pixel = &ps_info;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_LSHRREV_B32 v4, v19.sdwa(sel=0,sext=0), 8"),
+        "captured V_LSHRREV_B32 byte-selected shift was not decoded");
+  Check(Common::ContainsStr(result.ir_dump, "ShiftRightLogical32"),
+        "captured V_LSHRREV_B32 byte-selected shift was not lowered");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "captured V_LSHRREV_B32 did not emit OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "captured V_LSHRREV_B32 did not emit OpShiftRightLogical");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCapturedVop2SdwaByteLeftShift() {
+  const uint32_t shader[] = {
+      0x340d02f9u,
+      0x86030607u, // v_lshlrev_b32 v6, v7.byte3, 1 (PS 0x97f97b3c)
+      EncodeExp0(0x00, 0x1), EncodeExp1(6, 0, 0, 0), EncodeSopp(0x01),
+  };
+
+  ShaderPixelInputInfo ps_info{};
+  ps_info.ps_system_input_base = 7;
+  ps_info.ps_pos_x = true;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.input_info.pixel = &ps_info;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_LSHLREV_B32 v6, v7.sdwa(sel=3,sext=0), 1"),
+        "captured V_LSHLREV_B32 byte-selected shift was not decoded");
+  Check(Common::ContainsStr(result.ir_dump, "ShiftLeftLogical32"),
+        "captured V_LSHLREV_B32 byte-selected shift was not lowered");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "captured V_LSHLREV_B32 did not emit OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "captured V_LSHLREV_B32 did not emit OpShiftLeftLogical");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
@@ -4026,6 +4188,24 @@ void TestNewShaderDecoderArchitecture() {
   Check(DecodeInstruction(boot_ds, 0u, boot, &error), error.c_str());
   Check(boot.opcode == Opcode::DS_SWIZZLE_B32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
+
+  const uint32_t bpermute_ds[] = {0xda840000u, 0x00000214u};
+  Instruction bpermute;
+  Check(DecodeInstruction(bpermute_ds, 0u, bpermute, &error), error.c_str());
+  Check(bpermute.opcode == Opcode::DS_BPERMUTE_B32 &&
+            bpermute.src_count == 2u && bpermute.offset == 0u &&
+            bpermute.dst.reg == 0u && bpermute.src0.reg == 20u &&
+            bpermute.src1.reg == 2u,
+        "DS decoder rejected the captured bpermute instruction");
+
+  const uint32_t d16_hi_ds[] = {0xda9c0000u, 0x05000006u};
+  Instruction d16_hi;
+  Check(DecodeInstruction(d16_hi_ds, 0u, d16_hi, &error), error.c_str());
+  Check(d16_hi.opcode == Opcode::DS_READ_U16_D16_HI &&
+            d16_hi.src_count == 1u && d16_hi.data_bits == 16u &&
+            d16_hi.dst.reg == 5u && d16_hi.dst.sdwa_sel == 5u &&
+            d16_hi.dst.sdwa_dst_unused == 2u && d16_hi.src0.reg == 6u,
+        "DS decoder rejected the captured high-half D16 read");
 
   constexpr uint32_t packed_source_selectors[][2] = {
       {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
@@ -5639,14 +5819,40 @@ void TestCustomVintrpMovLowering() {
 
 void TestPsInputCountRegisterDecode() {
   HW::Context context;
-  // NUM_INTERP is 3 while bit 14 is an independent control flag that must be
-  // preserved.
-  context.SetPsInControl(0x00004003u);
+  // NUM_INTERP is 3 while bits 14 and 15 are independent control flags that
+  // must be preserved. Bit 15 selects Wave32 for pixel shaders.
+  context.SetPsInControl(0x0000c003u);
   const auto ps_in_control = context.GetShaderRegisters().ps_in_control;
-  Check(ps_in_control == 0x00004003u,
+  Check(ps_in_control == 0x0000c003u,
         "SPI_PS_IN_CONTROL flags were not preserved");
-  Check((ps_in_control & 0x3fu) == 3,
+  Check(Pm4::PixelInputCount(ps_in_control) == 3,
         "SPI_PS_IN_CONTROL NUM_INTERP decoding failed");
+  Check(Pm4::PixelWaveSize(ps_in_control) == 32u,
+        "SPI_PS_IN_CONTROL PS_W32_EN did not select wave32");
+  Check(Pm4::PixelWaveSize(0x00004003u) == 64u,
+        "pixel shader without PS_W32_EN did not select wave64");
+}
+
+void TestNewShaderDecoderCodeEndMarker() {
+  using namespace ShaderRecompiler::Decoder;
+
+  constexpr uint32_t code_end = 0xbf9f0000u;
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128),
+      code_end,
+      code_end,
+      code_end,
+      code_end,
+      code_end,
+      0x30306c73u, // Non-code metadata following the shader buffer.
+  };
+
+  Program decoded;
+  std::string error;
+  Check(DecodeProgram(shader, decoded, &error), error.c_str());
+  Check(decoded.instructions.size() == 1u &&
+            decoded.instructions.front().opcode == Opcode::S_MOV_B32,
+        "decoder did not stop at the five-word S_CODE_END marker");
 }
 
 void TestGraphicsCreateInterpolantMapping() {
@@ -6560,7 +6766,7 @@ void TestNewShaderRecompilerDsSubDwordLowering() {
       EncodeDs0(0x3a, 4), EncodeDs1(43, 0, 1), // ds_read_u8 v43, v1
       EncodeDs0(0x3b, 6), EncodeDs1(44, 0, 1), // ds_read_i16 v44, v1
       EncodeDs0(0x3c, 8), EncodeDs1(45, 0, 1), // ds_read_u16 v45, v1
-      0xda980000u, 0x07000007u, // ds_read_u16_d16 v7, v7
+      0xda980000u,        0x07000007u,         // ds_read_u16_d16 v7, v7
       0xbf810000u,
   };
 
@@ -6583,8 +6789,9 @@ void TestNewShaderRecompilerDsSubDwordLowering() {
         "new decoder did not decode DS signed short read");
   Check(Common::ContainsStr(result.decoded_dump, "ds_read_u16"),
         "new decoder did not decode DS unsigned short read");
-  Check(Common::ContainsStr(result.decoded_dump, "DS_READ_U16_D16 v7.sdwa(sel=4"),
-        "new decoder did not decode captured DS masked short read");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "DS_READ_U16_D16 v7.sdwa(sel=4"),
+      "new decoder did not decode captured DS masked short read");
   Check(Common::ContainsStr(result.decoded_dump, "dwords=1 bits=8"),
         "DS byte decode did not preserve byte-width metadata");
   Check(Common::ContainsStr(result.decoded_dump, "dwords=1 bits=16"),
@@ -8238,6 +8445,74 @@ void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerDsBpermuteLowering() {
+  const uint32_t shader[] = {
+      0xda840000u,
+      0x00000214u, // ds_bpermute_b32 v0, v20, v2 offset:0
+      EncodeDs0(0x0d),
+      EncodeDs1(0, 0, 3), // ds_write_b32 v0, v3
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump, "DS_BPERMUTE_B32"),
+        "new decoder did not decode DS bpermute");
+  Check(Common::ContainsStr(result.ir_dump, "BpermuteU32"),
+        "DS bpermute did not lower to explicit value IR");
+  Check(SpirvContainsOpcode(result.spirv, 345),
+        "SPIR-V binary does not contain OpGroupNonUniformShuffle");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd for DS bpermute offset");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not convert the byte address to a lane");
+  Check(SpirvContainsOpcode(result.spirv, 197) &&
+            SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not preserve the SDK 10 32-lane group");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgTerminalMergeArmBypass() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // outer condition
+      EncodeSopp(0x04, 6),    // outer -> candidate merge or nested arm
+      EncodeSopc(0x06, 1, 1), // nested condition
+      EncodeSopp(0x04, 2),    // nested -> bypass or second condition
+      EncodeSopc(0x06, 2, 2), // second condition
+      EncodeSopp(0x04, 2),    // second -> candidate merge or bypass
+      EncodeSMovB32(3, 129),  // bypass work
+      EncodeSopp(0x02, 1),    // bypass -> terminal merge
+      EncodeSMovB32(4, 129),  // candidate merge -> terminal merge
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        "terminal external S_SETPC fixture did not decode");
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "terminal merge arm bypass unexpectedly selected dispatcher control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry() {
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),    // entry -> header, skipping unreachable entry
@@ -8374,12 +8649,13 @@ void TestNewShaderRecompilerU64PairLowering() {
   std::string error;
 
   const uint32_t lshrrev_b64_shader[] = {
-      0xd7000001u, 0x0000d50cu, // v_lshrrev_b64 v[1:2], v12, vcc
+      0xd7000001u,
+      0x0000d50cu, // v_lshrrev_b64 v[1:2], v12, vcc
       EncodeSopp(0x01),
   };
   Decoder::Instruction decoded_lshrrev_b64;
-  Check(Decoder::DecodeInstruction(lshrrev_b64_shader, 0u,
-                                   decoded_lshrrev_b64, &error),
+  Check(Decoder::DecodeInstruction(lshrrev_b64_shader, 0u, decoded_lshrrev_b64,
+                                   &error),
         error.c_str());
   Check(decoded_lshrrev_b64.opcode == Decoder::Opcode::V_LSHRREV_B64 &&
             decoded_lshrrev_b64.dst.kind == Decoder::OperandKind::Vgpr &&
@@ -8391,19 +8667,19 @@ void TestNewShaderRecompilerU64PairLowering() {
         "decoder rejected captured VOP3 V_LSHRREV_B64 fields");
   Check(TryRecompile(lshrrev_b64_shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump,
-                            "V_LSHRREV_B64 v1, v12, vcc_lo"),
-        "captured VOP3 V_LSHRREV_B64 was not present in the decoded dump");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "V_LSHRREV_B64 v1, v12, vcc_lo"),
+      "captured VOP3 V_LSHRREV_B64 was not present in the decoded dump");
   Decoder::Program decoded_lshrrev_b64_program;
   CFG::Graph graph_lshrrev_b64;
   IR::Program native_lshrrev_b64;
-  Check(Decoder::DecodeProgram(lshrrev_b64_shader,
-                               decoded_lshrrev_b64_program, &error),
+  Check(Decoder::DecodeProgram(lshrrev_b64_shader, decoded_lshrrev_b64_program,
+                               &error),
         error.c_str());
-  Check(CFG::BuildGraph(decoded_lshrrev_b64_program, graph_lshrrev_b64,
-                        &error) &&
-            CFG::Structurize(graph_lshrrev_b64, &error),
-        error.c_str());
+  Check(
+      CFG::BuildGraph(decoded_lshrrev_b64_program, graph_lshrrev_b64, &error) &&
+          CFG::Structurize(graph_lshrrev_b64, &error),
+      error.c_str());
   Check(IR::LowerProgram(decoded_lshrrev_b64_program, graph_lshrrev_b64,
                          ShaderType::Compute, 64u, native_lshrrev_b64, &error),
         error.c_str());
@@ -8413,12 +8689,13 @@ void TestNewShaderRecompilerU64PairLowering() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t lshlrev_b64_shader[] = {
-      0xd6ff0021u, 0x00010303u, // v_lshlrev_b64 v[33:34], v3, 1
+      0xd6ff0021u,
+      0x00010303u, // v_lshlrev_b64 v[33:34], v3, 1
       EncodeSopp(0x01),
   };
   Decoder::Instruction decoded_lshlrev_b64;
-  Check(Decoder::DecodeInstruction(lshlrev_b64_shader, 0u,
-                                   decoded_lshlrev_b64, &error),
+  Check(Decoder::DecodeInstruction(lshlrev_b64_shader, 0u, decoded_lshlrev_b64,
+                                   &error),
         error.c_str());
   Check(decoded_lshlrev_b64.opcode == Decoder::Opcode::V_LSHLREV_B64 &&
             decoded_lshlrev_b64.dst.kind == Decoder::OperandKind::Vgpr &&
@@ -8432,19 +8709,18 @@ void TestNewShaderRecompilerU64PairLowering() {
         "decoder rejected captured VOP3 V_LSHLREV_B64 fields");
   Check(TryRecompile(lshlrev_b64_shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump,
-                            "V_LSHLREV_B64 v33, v3, 1"),
+  Check(Common::ContainsStr(result.decoded_dump, "V_LSHLREV_B64 v33, v3, 1"),
         "captured VOP3 V_LSHLREV_B64 was not present in the decoded dump");
   Decoder::Program decoded_lshlrev_b64_program;
   CFG::Graph graph_lshlrev_b64;
   IR::Program native_lshlrev_b64;
-  Check(Decoder::DecodeProgram(lshlrev_b64_shader,
-                               decoded_lshlrev_b64_program, &error),
+  Check(Decoder::DecodeProgram(lshlrev_b64_shader, decoded_lshlrev_b64_program,
+                               &error),
         error.c_str());
-  Check(CFG::BuildGraph(decoded_lshlrev_b64_program, graph_lshlrev_b64,
-                        &error) &&
-            CFG::Structurize(graph_lshlrev_b64, &error),
-        error.c_str());
+  Check(
+      CFG::BuildGraph(decoded_lshlrev_b64_program, graph_lshlrev_b64, &error) &&
+          CFG::Structurize(graph_lshlrev_b64, &error),
+      error.c_str());
   Check(IR::LowerProgram(decoded_lshlrev_b64_program, graph_lshlrev_b64,
                          ShaderType::Compute, 64u, native_lshlrev_b64, &error),
         error.c_str());
@@ -8454,13 +8730,14 @@ void TestNewShaderRecompilerU64PairLowering() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t cmpx_i64_shader[] = {
-      0xd4b5007eu, 0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
+      0xd4b5007eu,
+      0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
       EncodeSopp(0x01),
   };
   Decoder::Instruction decoded_cmpx_i64;
-  Check(Decoder::DecodeInstruction(cmpx_i64_shader, 0u, decoded_cmpx_i64,
-                                   &error),
-        error.c_str());
+  Check(
+      Decoder::DecodeInstruction(cmpx_i64_shader, 0u, decoded_cmpx_i64, &error),
+      error.c_str());
   Check(decoded_cmpx_i64.opcode == Decoder::Opcode::V_CMPX_NE_I64 &&
             decoded_cmpx_i64.dst.kind == Decoder::OperandKind::ExecLo &&
             decoded_cmpx_i64.src0.value == 0u &&
@@ -8468,9 +8745,9 @@ void TestNewShaderRecompilerU64PairLowering() {
             decoded_cmpx_i64.src1.reg == 7u,
         "decoder rejected captured VOP3 V_CMPX_NE_I64 fields");
   Check(TryRecompile(cmpx_i64_shader, options, result, &error), error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump,
-                            "V_CMPX_NE_I64 exec_lo, 0, v7"),
-        "captured VOP3 V_CMPX_NE_I64 was not present in the decoded dump");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "V_CMPX_NE_I64 exec_lo, 0, v7"),
+      "captured VOP3 V_CMPX_NE_I64 was not present in the decoded dump");
   Decoder::Program decoded_i64_program;
   CFG::Graph graph_i64;
   IR::Program native_i64;
@@ -8522,8 +8799,7 @@ void TestNewShaderRecompilerU64PairLowering() {
       EncodeSopp(0x01),
   };
   Decoder::Instruction decoded_cmpx_v2;
-  Check(Decoder::DecodeInstruction(cmpx_v2_shader, 0u, decoded_cmpx_v2,
-                                   &error),
+  Check(Decoder::DecodeInstruction(cmpx_v2_shader, 0u, decoded_cmpx_v2, &error),
         error.c_str());
   Check(decoded_cmpx_v2.opcode == Decoder::Opcode::V_CMPX_NE_U64 &&
             decoded_cmpx_v2.dst.kind == Decoder::OperandKind::ExecLo &&
@@ -8532,9 +8808,9 @@ void TestNewShaderRecompilerU64PairLowering() {
             decoded_cmpx_v2.src1.reg == 2u,
         "decoder rejected reported VOPC V_CMPX_NE_U64 fields");
   Check(TryRecompile(cmpx_v2_shader, options, result, &error), error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump,
-                            "V_CMPX_NE_U64 exec_lo, 0, v2"),
-        "reported VOPC V_CMPX_NE_U64 was not present in the decoded dump");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "V_CMPX_NE_U64 exec_lo, 0, v2"),
+      "reported VOPC V_CMPX_NE_U64 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t empty_shader[] = {EncodeSopp(0x01)};
@@ -8620,6 +8896,69 @@ void TestComputeDispatchWaveSize() {
         "dispatch without CS_W32_EN did not select wave64");
   Check(Pm4::ComputeWaveSize(0x00008041u) == 32u,
         "dispatch with CS_W32_EN did not select wave32");
+}
+
+void TestPixelShaderWaveIdentity() {
+  HW::PixelShaderInfo regs{};
+  ShaderPixelInputInfo wave64{};
+  ShaderPixelInputInfo wave32{};
+  wave32.wave_size = 32u;
+  Check(ShaderGetIdPS(regs, wave64, false) !=
+            ShaderGetIdPS(regs, wave32, false),
+        "pixel shader cache identity omitted the wave size");
+
+  ShaderPixelInputInfo host32{};
+  ShaderPixelInputInfo host64{};
+  host32.host_subgroup_size = 32u;
+  host64.host_subgroup_size = 64u;
+  Check(ShaderGetIdPS(regs, host32, false) !=
+            ShaderGetIdPS(regs, host64, false),
+        "pixel shader cache identity omitted the host subgroup size");
+
+  const uint32_t shader[] = {
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01),
+  };
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.ps_regs.chksum = 0x5a32f06400000001ull;
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+
+  HW::ShaderRegisters wave64_sh{};
+  wave64_sh.target_output_mode[0] = 4;
+  HW::ShaderRegisters wave32_sh = wave64_sh;
+  wave32_sh.ps_in_control =
+      Pm4::SPI_PS_IN_CONTROL_PS_W32_EN_MASK
+      << Pm4::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
+  ShaderVertexInputInfo vertex{};
+  std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  ShaderPixelInputInfo compiled64{};
+  ShaderPixelInputInfo compiled32{};
+  ShaderPixelInputInfo compiled_host64{};
+  std::span<const uint32_t> spirv64;
+  std::span<const uint32_t> spirv32;
+  std::span<const uint32_t> spirv_host64;
+  Check(ShaderCompileInfoPS(regs, wave64_sh, vertex, mappings, compiled64,
+                            spirv64, 32u) &&
+            ShaderCompileInfoPS(regs, wave32_sh, vertex, mappings, compiled32,
+                                spirv32, 32u) &&
+            ShaderCompileInfoPS(regs, wave64_sh, vertex, mappings,
+                                compiled_host64, spirv_host64, 64u),
+        "pixel wave-size specialization failed to compile");
+  Check(compiled64.wave_size == 64u && compiled32.wave_size == 32u &&
+            compiled64.host_subgroup_size == 32u &&
+            compiled32.host_subgroup_size == 32u &&
+            compiled_host64.host_subgroup_size == 64u &&
+            compiled64.stage.program != nullptr &&
+            compiled32.stage.program != nullptr &&
+            compiled_host64.stage.program != nullptr &&
+            compiled64.stage.program->wave_size == 64u &&
+            compiled32.stage.program->wave_size == 32u &&
+            compiled64.stage.program != compiled32.stage.program &&
+            compiled64.stage.program != compiled_host64.stage.program &&
+            spirv64.data() != spirv32.data() &&
+            spirv64.data() != spirv_host64.data(),
+        "pixel guest wave or host subgroup size did not reach the program cache");
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
@@ -8764,6 +9103,95 @@ void TestNewShaderRecompilerSetpcBranch() {
   Check(Common::ContainsStr(result.ir_dump, "successors=["),
         "S_SETPC_B64 did not participate in CFG");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerTerminalExternalSetpc() {
+  constexpr uint32_t code_end = 0xbf9f0000u;
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),
+      EncodeSop1(0x20, 0, 6), // s_setpc_b64 s[6:7]
+      code_end,
+      code_end,
+      code_end,
+      code_end,
+      code_end,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  const bool decoded_shader = ShaderRecompiler::Decoder::DecodeProgram(
+      std::span{shader}, decoded, &error);
+  Check(decoded_shader, error.empty()
+                            ? "terminal external S_SETPC fixture did not decode"
+                            : error.c_str());
+
+  ShaderRecompiler::CFG::Graph rejected;
+  Check(!ShaderRecompiler::CFG::BuildGraph(decoded, rejected, &error),
+        "dynamic terminal S_SETPC was accepted without an external exit");
+
+  ShaderRecompiler::CFG::Graph accepted;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, accepted, &error, 6),
+        "terminal external S_SETPC was not accepted");
+  Check(!accepted.blocks.empty() &&
+            accepted.blocks.front().terminator.kind ==
+                ShaderRecompiler::CFG::TerminatorKind::Return,
+        "terminal external S_SETPC did not become a CFG return");
+
+  const uint32_t non_terminal[] = {
+      EncodeSop1(0x20, 0, 6),
+      EncodeSMovB32(0, 129),
+      code_end,
+      code_end,
+      code_end,
+      code_end,
+      code_end,
+  };
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{non_terminal},
+                                                 decoded, &error),
+        "non-terminal S_SETPC fixture did not decode");
+  Check(!ShaderRecompiler::CFG::BuildGraph(decoded, accepted, &error, 6),
+        "non-terminal dynamic S_SETPC was accepted as an external exit");
+}
+
+void TestSplitGeometryProgramLinking() {
+  const uint32_t front[] = {
+      EncodeDs0(0x0d),
+      EncodeDs1(0, 4, 1), // ds_write_b32 v4, v1
+      EncodeSop1(0x20, 0, 6),
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u,
+      0xbf9f0000u,
+  };
+  const uint32_t back[] = {
+      EncodeDs0(0x36),
+      EncodeDs1(8, 0, 1), // ds_read_b32 v8, v1
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(8, 8, 8, 8),
+      EncodeSopp(0x01),
+  };
+
+  std::vector<uint32_t> linked;
+  std::string error;
+  Check(ShaderRecompiler::TryLinkSplitGeometryPrograms(front, back, linked,
+                                                        &error),
+        error.c_str());
+  Check(linked.size() == 7u && linked[2] == back[0],
+        "split geometry linker did not replace the continuation with GsBack");
+
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(linked, options, result, &error),
+        error.c_str());
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t non_relocatable_back[] = {
+      EncodeSop1(0x1f, 4, 0),
+      EncodeDs0(0x36), EncodeDs1(8, 0, 1),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(8, 8, 8, 8),
+      EncodeSopp(0x01),
+  };
+  Check(!ShaderRecompiler::TryLinkSplitGeometryPrograms(
+            front, non_relocatable_back, linked, &error),
+        "split geometry linker accepted a PC-relative GsBack");
 }
 
 void TestNewShaderRecompilerSetpcJumpTable() {
@@ -8986,10 +9414,14 @@ void TestNewShaderRecompilerAuxPositionExports() {
   };
 
   const uint32_t all_outputs[] = {
-      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
-      EncodeExp0(0x0d, 0x5, false), EncodeExp1(4, 5, 6, 7),
-      EncodeExp0(0x0e, 0xb, false), EncodeExp1(8, 9, 10, 11),
-      EncodeExp0(0x0f, 0x6), EncodeExp1(12, 13, 14, 15),
+      EncodeExp0(0x0c, 0xf, false),
+      EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x5, false),
+      EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0e, 0xb, false),
+      EncodeExp1(8, 9, 10, 11),
+      EncodeExp0(0x0f, 0x6),
+      EncodeExp1(12, 13, 14, 15),
       0xbf810000u,
   };
   const auto all = compile(all_outputs, 0x00e5aa55u);
@@ -8998,12 +9430,12 @@ void TestNewShaderRecompilerAuxPositionExports() {
             std::vector<uint32_t>({UINT32_MAX}),
         "POS1-POS3 overwrote gl_Position");
   Check(SpirvStoredBuiltInElements(all.spirv, 1u) ==
-            std::vector<uint32_t>({UINT32_MAX}) &&
+                std::vector<uint32_t>({UINT32_MAX}) &&
             SpirvStoredBuiltInElements(all.spirv, 9u) ==
                 std::vector<uint32_t>({UINT32_MAX}),
         "MISC point-size/layer stores are missing");
   Check(SpirvStoredBuiltInElements(all.spirv, 3u) ==
-            std::vector<uint32_t>({0u, 3u}) &&
+                std::vector<uint32_t>({0u, 3u}) &&
             SpirvStoredBuiltInElements(all.spirv, 4u) ==
                 std::vector<uint32_t>({0u, 1u, 2u}),
         "partial clip/cull exports used the wrong dense elements");
@@ -9016,23 +9448,29 @@ void TestNewShaderRecompilerAuxPositionExports() {
             SpirvContainsCapability(all.spirv, 5254u),
         "auxiliary vertex BuiltIns or capabilities are missing");
   const auto all_source = DisassembleSpirvBinary(all.spirv);
-  Check(Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
-            SpirvBuiltInStoreUsesAndConstant(all.spirv, 9u, 0x7ffu),
-        "layer export extension or GFX10 layer mask is missing");
+  Check(
+      Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
+          SpirvBuiltInStoreUsesAndConstant(all.spirv, 9u, 0x7ffu),
+      "layer export extension or GFX10 layer mask is missing");
   const auto positions = std::count_if(
       all.program.info.outputs.begin(), all.program.info.outputs.end(),
       [](const auto &output) {
         return output.kind == ShaderRecompiler::IR::StageOutputKind::Position;
       });
   Check(positions == 1 &&
-            std::ranges::find_if(all.program.info.outputs, [](const auto &output) {
-              return output.kind == ShaderRecompiler::IR::StageOutputKind::Position;
-            })->index == 0,
+            std::ranges::find_if(
+                all.program.info.outputs,
+                [](const auto &output) {
+                  return output.kind ==
+                         ShaderRecompiler::IR::StageOutputKind::Position;
+                })->index == 0,
         "shader info did not reserve Position exclusively for POS0");
 
   const uint32_t cc1_only[] = {
-      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
-      EncodeExp0(0x0d, 0x6), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0c, 0xf, false),
+      EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x6),
+      EncodeExp1(4, 5, 6, 7),
       0xbf810000u,
   };
   const auto dense = compile(cc1_only, 0x0080a050u);
@@ -9045,9 +9483,12 @@ void TestNewShaderRecompilerAuxPositionExports() {
         "CCDIST1 was not densely packed into POS1");
 
   const uint32_t middle_hole[] = {
-      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
-      EncodeExp0(0x0d, 0x1, false), EncodeExp1(4, 5, 6, 7),
-      EncodeExp0(0x0e, 0x3), EncodeExp1(8, 9, 10, 11),
+      EncodeExp0(0x0c, 0xf, false),
+      EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x1, false),
+      EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0e, 0x3),
+      EncodeExp1(8, 9, 10, 11),
       0xbf810000u,
   };
   const auto shifted = compile(middle_hole, 0x00a12010u);
@@ -9061,8 +9502,10 @@ void TestNewShaderRecompilerAuxPositionExports() {
 
   const auto rejects = [](uint32_t control, uint32_t en, const char *message) {
     const uint32_t shader[] = {
-        EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
-        EncodeExp0(0x0d, en), EncodeExp1(4, 5, 6, 7),
+        EncodeExp0(0x0c, 0xf, false),
+        EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(0x0d, en),
+        EncodeExp1(4, 5, 6, 7),
         0xbf810000u,
     };
     ShaderVertexInputInfo vertex{};
@@ -10238,6 +10681,49 @@ void TestNewShaderRecompilerExpPixelOutputs() {
         "compressed UINT16 MRT export was incorrectly decoded as FP16");
   CheckSpirvBinaryValidates(uint16_result.spirv);
 
+  ShaderPixelInputInfo r32_uint_info;
+  r32_uint_info.target_output_mode[0] = 1;
+  r32_uint_info.target_output_type[0] = ShaderMrtOutputType::Uint;
+  options.input_info.pixel = &r32_uint_info;
+  ShaderRecompiler::CompileResult r32_uint_result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, r32_uint_result,
+                                       &error),
+        error.c_str());
+  const auto r32_uint_source = DisassembleSpirvBinary(r32_uint_result.spirv);
+  Check(Common::ContainsStr(r32_uint_source,
+                            "OpVariable %_ptr_Output_v4uint Output"),
+        "FMT_32_R uint render target did not use an unsigned output");
+  CheckSpirvBinaryValidates(r32_uint_result.spirv);
+
+  ShaderPixelInputInfo r32_float_info;
+  r32_float_info.target_output_mode[0] = 1;
+  r32_float_info.target_output_type[0] = ShaderMrtOutputType::Float;
+  options.input_info.pixel = &r32_float_info;
+  ShaderRecompiler::CompileResult r32_float_result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, r32_float_result,
+                                       &error),
+        error.c_str());
+  const auto r32_float_source = DisassembleSpirvBinary(r32_float_result.spirv);
+  Check(Common::ContainsStr(r32_float_source,
+                            "OpVariable %_ptr_Output_v4float Output") &&
+            !Common::ContainsStr(r32_float_source,
+                                 "OpVariable %_ptr_Output_v4uint Output"),
+        "FMT_32_R float render target acquired an integer output");
+  CheckSpirvBinaryValidates(r32_float_result.spirv);
+
+  ShaderPixelInputInfo sint16_info;
+  sint16_info.target_output_mode[0] = 8;
+  options.input_info.pixel = &sint16_info;
+  ShaderRecompiler::CompileResult sint16_result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, sint16_result, &error),
+        error.c_str());
+  const auto sint16_source = DisassembleSpirvBinary(sint16_result.spirv);
+  Check(Common::ContainsStr(sint16_source,
+                            "OpVariable %_ptr_Output_v4int Output") &&
+            CountSourceOccurrences(sint16_source, "OpBitFieldSExtract") == 4u,
+        "compressed SINT16 MRT export did not sign-extend integer lanes");
+  CheckSpirvBinaryValidates(sint16_result.spirv);
+
   ShaderPixelInputInfo unorm16_info;
   unorm16_info.target_output_mode[0] = 5;
   options.input_info.pixel = &unorm16_info;
@@ -10281,6 +10767,11 @@ void TestNewShaderRecompilerExpPixelOutputs() {
                                          "OpCompositeConstruct", "%uint_1"),
         "disabled integer alpha export did not default to integer one");
   CheckSpirvBinaryValidates(partial_uint_result.spirv);
+
+  HW::PixelShaderInfo cache_regs{};
+  Check(ShaderGetIdPS(cache_regs, r32_uint_info, false) !=
+            ShaderGetIdPS(cache_regs, r32_float_info, false),
+        "pixel shader cache identity omitted the MRT scalar type");
 
   const uint32_t compressed_ba_shader[] = {
       EncodeExp0(0x00, 0xc, true, true),
@@ -10501,18 +10992,16 @@ void TestRenderTargetReverseExportMapping() {
   ShaderPixelInputInfo compiled_info{};
   ShaderVertexInputInfo vertex_info{};
   std::span<const uint32_t> compiled_spirv;
-  Check(
-      ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
-                          compiled_spirv) &&
-          compiled_info.target_export_mapping[0].IsIdentity(),
-      "inactive reverse MRT mapping was not normalized out of the shader "
-      "cache key");
+  Check(ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
+                            compiled_spirv) &&
+            compiled_info.target_export_mapping[0].IsIdentity(),
+        "inactive reverse MRT mapping was not normalized out of the shader "
+        "cache key");
   sh.target_output_mode[0] = 4;
-  Check(
-      ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
-                          compiled_spirv) &&
-          compiled_info.target_export_mapping[0] == gr32.export_mapping,
-      "active reverse MRT mapping was lost before shader specialization");
+  Check(ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
+                            compiled_spirv) &&
+            compiled_info.target_export_mapping[0] == gr32.export_mapping,
+        "active reverse MRT mapping was lost before shader specialization");
 }
 
 void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
@@ -10663,7 +11152,11 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   }
   Check(float_storage != UINT32_MAX,
         "native validation fixture lacks float storage image");
+  stale_resources.images[float_storage].dwords[0] = 0x1000u;
   stale_resources.images[float_storage].dwords[1] = 20u << 20u;
+  stale_resources.images[float_storage].dwords[3] =
+      result.program.info.images[float_storage].shader_swizzle |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
   rejected_spirv = rejected_before;
   rejected_error.clear();
   Check(!ShaderRecompiler::Spirv::EmitProgram(
@@ -10674,6 +11167,9 @@ void TestNewShaderRecompilerNativeBindingPlan() {
         "stale runtime image format re-selected an absent descriptor group");
 
   auto stale_dimension = result.resources;
+  stale_dimension.images[float_storage].dwords[0] = 0x1000u;
+  stale_dimension.images[float_storage].dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u;
   stale_dimension.images[float_storage].dwords[3] &= 0x0fffffffu;
   rejected_spirv = rejected_before;
   rejected_error.clear();
@@ -11703,23 +12199,22 @@ void TestSharedMemoryBarrierSafety() {
     }
     return program;
   };
-  const auto append_write = [](Block& block) {
-    auto& inst = block.AppendNewInst(
-        ValueOpcode::WriteSharedU32,
-        {Value(0u), Value(1u), Value(true)});
+  const auto append_write = [](Block &block) {
+    auto &inst = block.AppendNewInst(ValueOpcode::WriteSharedU32,
+                                     {Value(0u), Value(1u), Value(true)});
     inst.SetFlags(MemoryFlags{.index = 0});
   };
-  const auto append_read = [](Block& block) {
-    auto& inst = block.AppendNewInst(ValueOpcode::LoadSharedU32,
+  const auto append_read = [](Block &block) {
+    auto &inst = block.AppendNewInst(ValueOpcode::LoadSharedU32,
                                      {Value(0u), Value(true)});
     inst.SetFlags(MemoryFlags{.index = 0});
   };
-  const auto count_barriers = [](const Block& block) {
-    return std::ranges::count_if(block, [](const Inst& inst) {
+  const auto count_barriers = [](const Block &block) {
+    return std::ranges::count_if(block, [](const Inst &inst) {
       return inst.GetOpcode() == ValueOpcode::Barrier;
     });
   };
-  const auto divergent_condition = [](ValueProgram& program, size_t block) {
+  const auto divergent_condition = [](ValueProgram &program, size_t block) {
     IREmitter ir(program.blocks[block]);
     const auto local_id = U32(ir.Emit(
         ValueOpcode::GetBuiltin,
@@ -11738,9 +12233,10 @@ void TestSharedMemoryBarrierSafety() {
   auto phases = make_program(1);
   append_write(*phases.blocks[0]);
   append_read(*phases.blocks[0]);
-  const auto phase_stats = InsertSharedMemoryBarriers(phases, 64u, compute_info);
+  const auto phase_stats =
+      InsertSharedMemoryBarriers(phases, 64u, compute_info);
   std::vector<ValueOpcode> phase_opcodes;
-  for (const auto& inst : *phases.blocks[0]) {
+  for (const auto &inst : *phases.blocks[0]) {
     phase_opcodes.push_back(inst.GetOpcode());
   }
   Check(phase_stats.inserted_barriers == 2 && phase_opcodes.size() == 4 &&
@@ -11761,8 +12257,7 @@ void TestSharedMemoryBarrierSafety() {
       InsertSharedMemoryBarriers(selection, 64u, compute_info);
   Check(selection_stats.inserted_barriers == 2 &&
             count_barriers(*selection.blocks[1]) == 0 &&
-            selection.blocks[2]->begin()->GetOpcode() ==
-                ValueOpcode::Barrier,
+            selection.blocks[2]->begin()->GetOpcode() == ValueOpcode::Barrier,
         "workgroup barrier was placed inside divergent selection flow");
 
   auto loop = make_program(1);
@@ -11807,30 +12302,33 @@ void TestPixelProgramCacheBindingIdentity() {
     ShaderVertexInputInfo vertex_info{};
     ShaderPixelInputInfo first_info{};
     std::span<const uint32_t> first_spirv;
-    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings, first_info,
-                              first_spirv),
+    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings,
+                              first_info, first_spirv),
           "pixel program-cache fixture failed to compile");
 
     ShaderPixelInputInfo second_info{};
     std::span<const uint32_t> second_spirv;
-    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings, second_info,
-                              second_spirv),
+    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings,
+                              second_info, second_spirv),
           "pixel program-cache lookup failed");
-    Check(
-        first_info.stage.program != nullptr &&
-            second_info.stage.program == first_info.stage.program &&
-            second_spirv.data() == first_spirv.data() &&
-            second_spirv.size() == first_spirv.size(),
-        "pixel program cache did not reuse an identical graphics placement");
+    Check(first_info.stage.program != nullptr &&
+              second_info.stage.program == first_info.stage.program &&
+              second_spirv.data() == first_spirv.data() &&
+              second_spirv.size() == first_spirv.size(),
+          "pixel program cache did not reuse an identical graphics placement");
   };
 
   check_cache_identity(shader_01, 0x91a27e6300000001ull);
   check_cache_identity(shader_10, 0x91a27e6300000002ull);
 
   const uint32_t push_shader[] = {
-      EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
-      EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
-      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+      EncodeVop1(0x01, 0, 0),
+      EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2),
+      EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
   };
   HW::PixelShaderInfo push_regs{};
   push_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(push_shader);
@@ -11865,26 +12363,30 @@ void TestPixelProgramCacheBindingIdentity() {
             ShaderCompileInfoPS(push_regs, push_sh, vertex_at_zero, mappings,
                                 at_zero_again, spirv_at_zero_again),
         "pixel program-cache placement fixture failed to compile");
-  Check(at_zero.push_constant_offset == 0 &&
-            at_36.push_constant_offset == 36 &&
+  Check(at_zero.push_constant_offset == 0 && at_36.push_constant_offset == 36 &&
             at_zero.stage.program != at_36.stage.program &&
             spirv_at_zero.data() != spirv_at_36.data() &&
             at_zero_again.stage.program == at_zero.stage.program &&
             spirv_at_zero_again.data() == spirv_at_zero.data() &&
             SpirvHasMemberDecorationValue(spirv_at_36, 35u, 36u),
-        "pixel program cache did not partition and reuse graphics push placement");
+        "pixel program cache did not partition and reuse graphics push "
+        "placement");
 }
 
 void TestGraphicsPushConstantPlacement() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
   constexpr uint32_t OffsetDecoration = 35;
   const uint32_t shader[] = {
-      EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
-      EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
-      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+      EncodeVop1(0x01, 0, 0),
+      EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2),
+      EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
   };
-  const std::array<uint32_t, 4> user_data = {
-      0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+  const std::array<uint32_t, 4> user_data = {0x3e800000u, 0x3f000000u,
+                                             0x3f400000u, 0x3f800000u};
   ShaderPixelInputInfo pixel_info{};
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
@@ -12280,6 +12782,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestGraphicsBarrierScope();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();
@@ -12288,12 +12791,18 @@ int main() {
   TestNewShaderRecompilerTypedBufferLowering();
   TestNewShaderRecompilerDsReadWrite2Lowering();
   TestNewShaderRecompilerDsWideAndAtomicLowering();
+  TestNewShaderRecompilerDsBpermuteLowering();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
+  TestNewShaderRecompilerCapturedVop1SdwaFindFirstBitLow();
+  TestNewShaderRecompilerCapturedVop1SdwaNotByte0();
+  TestNewShaderRecompilerCapturedVop2SdwaByteShift();
+  TestNewShaderRecompilerCapturedVop2SdwaByteLeftShift();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized direct SPIR-V are exercised by
   // ShaderRecompilerComputeTests. The pre-SSA register-IR shape checks above
   // remain as historical decoder fixtures only.
   TestNewShaderDecoderArchitecture();
+  TestNewShaderDecoderCodeEndMarker();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestPsInputCountRegisterDecode();
@@ -12333,16 +12842,20 @@ int main() {
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
+  TestNewShaderRecompilerCfgTerminalMergeArmBypass();
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerU64PairLowering();
   TestComputeDispatchWaveSize();
+  TestPixelShaderWaveIdentity();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestNewShaderRecompilerTerminalExternalSetpc();
+  TestSplitGeometryProgramLinking();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();

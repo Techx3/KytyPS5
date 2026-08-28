@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -26,12 +27,20 @@ struct BufferView {
 	vk::DeviceSize range  = VK_WHOLE_SIZE;
 };
 
+enum class TextureFallbackReason : uint8_t {
+	None,
+	NullDescriptor,
+	InvalidIndirectLayout,
+	UnbackedIndirectRange,
+};
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	TextureFallbackReason      fallback = TextureFallbackReason::None;
 };
 
 struct NativeDescriptors {
@@ -54,6 +63,9 @@ struct PreparedBindings {
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;
 };
+
+[[nodiscard]] std::string DescribeImageBindings(const PreparedBindings& prepared,
+                                                TextureCache&           texture_cache);
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);

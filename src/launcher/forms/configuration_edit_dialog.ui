@@ -108,6 +108,16 @@
            </property>
           </widget>
          </item>
+         <item row="3" column="1">
+          <widget class="QCheckBox" name="checkBox_vulkan_debug_markers">
+           <property name="toolTip">
+            <string>Add lightweight Vulkan object names and command labels for Nsight or RenderDoc</string>
+           </property>
+           <property name="text">
+            <string>Vulkan debug markers</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </widget>
       </item>
@@ -280,6 +290,109 @@
        <widget class="QComboBox" name="comboBox_profiler_direction">
         <property name="toolTip">
          <string>Enable or disable profiler. If enabled may decrease emulator performance</string>
+        </property>
+       </widget>
+      </item>
+      <item row="12" column="0">
+       <widget class="QLabel" name="label_local_players">
+        <property name="text">
+         <string>Local players:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="12" column="1">
+       <widget class="QSpinBox" name="spinBox_local_players">
+        <property name="toolTip">
+         <string>Maximum number of local users exposed to the game</string>
+        </property>
+        <property name="minimum">
+         <number>1</number>
+        </property>
+        <property name="maximum">
+         <number>4</number>
+        </property>
+        <property name="value">
+         <number>4</number>
+        </property>
+       </widget>
+      </item>
+      <item row="13" column="0">
+       <widget class="QLabel" name="label_controller_guid_1">
+        <property name="text">
+         <string>Player 1 controller GUID:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="13" column="1">
+       <widget class="QLineEdit" name="lineEdit_controller_guid_1">
+        <property name="toolTip">
+         <string>Optional 32-digit SDL GUID shown in the emulator log</string>
+        </property>
+        <property name="maxLength">
+         <number>32</number>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="14" column="0">
+       <widget class="QLabel" name="label_controller_guid_2">
+        <property name="text">
+         <string>Player 2 controller GUID:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="14" column="1">
+       <widget class="QLineEdit" name="lineEdit_controller_guid_2">
+        <property name="toolTip">
+         <string>Optional 32-digit SDL GUID shown in the emulator log</string>
+        </property>
+        <property name="maxLength">
+         <number>32</number>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="15" column="0">
+       <widget class="QLabel" name="label_controller_guid_3">
+        <property name="text">
+         <string>Player 3 controller GUID:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="15" column="1">
+       <widget class="QLineEdit" name="lineEdit_controller_guid_3">
+        <property name="toolTip">
+         <string>Optional 32-digit SDL GUID shown in the emulator log</string>
+        </property>
+        <property name="maxLength">
+         <number>32</number>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="16" column="0">
+       <widget class="QLabel" name="label_controller_guid_4">
+        <property name="text">
+         <string>Player 4 controller GUID:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="16" column="1">
+       <widget class="QLineEdit" name="lineEdit_controller_guid_4">
+        <property name="toolTip">
+         <string>Optional 32-digit SDL GUID shown in the emulator log</string>
+        </property>
+        <property name="maxLength">
+         <number>32</number>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
         </property>
        </widget>
       </item>

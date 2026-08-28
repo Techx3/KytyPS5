@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -74,7 +75,7 @@ bool IsDescriptorHandle(ValueOpcode opcode) {
 	}
 }
 
-bool IsRuntimeIntegerOp(ValueOpcode op) {
+bool IsRuntimeValueOp(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
@@ -102,6 +103,8 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::ULessThan32:
@@ -111,7 +114,19 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
-		case ValueOpcode::LogicalNot: return true;
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32: return true;
 		default: return false;
 	}
 }
@@ -133,9 +148,10 @@ private:
 				case Type::U8:
 				case Type::U16:
 				case Type::U32:
-				case Type::U64: return true;
+				case Type::U64:
+				case Type::F32: return true;
 				default:
-					reason = fmt::format("contains a non-integer immediate of type {}",
+					reason = fmt::format("contains an unsupported immediate of type {}",
 					                     TypeName(value.GetType()));
 					return false;
 			}
@@ -175,13 +191,30 @@ private:
 			}
 			return finish(true);
 		}
-		if (op == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(m_values, value);
-			if (invariant.IsEmpty()) {
-				reason = "contains a control-dependent phi";
+		if (op == ValueOpcode::WqmMask) {
+			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::U1) {
+				reason = "contains a malformed WqmMask";
 				return finish(false);
 			}
-			return finish(Validate(invariant, reason));
+			// WQM changes only per-lane masks. A descriptor expression that is already
+			// runtime-uniform is unchanged, while lane-dependent inputs remain rejected
+			// by the recursive validator.
+			return finish(Validate(inst->Arg(0), reason));
+		}
+		if (op == ValueOpcode::Phi) {
+			const auto invariant = ResolveInvariantPhi(m_values, value);
+			if (!invariant.IsEmpty()) {
+				return finish(Validate(invariant, reason));
+			}
+			if (!ValidatePhiControl(*inst, reason)) {
+				return finish(false);
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				if (!Validate(inst->Arg(index), reason)) {
+					return finish(false);
+				}
+			}
+			return finish(true);
 		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
@@ -238,7 +271,7 @@ private:
 				return finish(false);
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeIntegerOp(op)) {
+		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeValueOp(op)) {
 			reason =
 			    fmt::format("contains unsupported or control-dependent {}", ValueOpcodeName(op));
 			return finish(false);
@@ -249,6 +282,99 @@ private:
 			}
 		}
 		return finish(true);
+	}
+
+	bool ValidatePhiControl(const Inst& phi, std::string& reason) {
+		const auto* target = phi.Parent();
+		if (target == nullptr || m_values.blocks.empty() ||
+		    m_values.block_info.size() != m_values.blocks.size()) {
+			reason = "contains a control-dependent phi without a complete CFG";
+			return false;
+		}
+		std::unordered_set<const Block*> reachable_from_target;
+		std::vector<const Block*>        forward(target->ImmSuccessors().begin(),
+		                                         target->ImmSuccessors().end());
+		while (!forward.empty()) {
+			const auto* block = forward.back();
+			forward.pop_back();
+			if (!reachable_from_target.insert(block).second) {
+				continue;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				forward.push_back(successor);
+			}
+		}
+		for (size_t index = 0; index < phi.NumArgs(); index++) {
+			if (reachable_from_target.contains(phi.PhiBlock(index))) {
+				reason = "contains a control-dependent phi crossing a CFG cycle";
+				return false;
+			}
+		}
+
+		std::unordered_set<const Block*> reaches_target;
+		std::vector<const Block*>        pending {target};
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (!reaches_target.insert(block).second) {
+				continue;
+			}
+			for (const auto* predecessor: block->ImmPredecessors()) {
+				pending.push_back(predecessor);
+			}
+		}
+		if (!reaches_target.contains(m_values.blocks.front())) {
+			reason = "contains a control-dependent phi unreachable from the CFG entry";
+			return false;
+		}
+
+		std::unordered_set<const Block*> visiting;
+		std::unordered_set<const Block*> visited;
+		const auto validate_path = [&](const auto& self, const Block* block) -> bool {
+			if (block == target || !reaches_target.contains(block) || visited.contains(block)) {
+				return true;
+			}
+			if (!visiting.insert(block).second) {
+				reason = "contains a control-dependent phi crossing a CFG cycle";
+				return false;
+			}
+			const auto found = std::ranges::find(m_values.blocks, block);
+			if (found == m_values.blocks.end()) {
+				reason = "contains a control-dependent phi with a foreign CFG block";
+				return false;
+			}
+			const auto& info =
+			    m_values.block_info[static_cast<size_t>(found - m_values.blocks.begin())];
+			if (info.terminator.kind == CFG::TerminatorKind::ConditionalBranch) {
+				if (info.condition.IsEmpty() || !Validate(info.condition, reason)) {
+					if (reason.empty()) {
+						reason =
+						    "contains a control-dependent phi with an unresolved branch condition";
+					}
+					return false;
+				}
+			} else if (info.terminator.kind == CFG::TerminatorKind::IndirectBranch) {
+				if (info.indirect_target.IsEmpty() || !Validate(info.indirect_target, reason)) {
+					if (reason.empty()) {
+						reason =
+						    "contains a control-dependent phi with an unresolved indirect target";
+					}
+					return false;
+				}
+			} else if (info.terminator.kind != CFG::TerminatorKind::Branch) {
+				reason = "contains a control-dependent phi without an executable CFG path";
+				return false;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				if (reaches_target.contains(successor) && !self(self, successor)) {
+					return false;
+				}
+			}
+			visiting.erase(block);
+			visited.insert(block);
+			return true;
+		};
+		return validate_path(validate_path, m_values.blocks.front());
 	}
 
 	const Program&                  m_program;
@@ -442,7 +568,8 @@ private:
 				case Type::U16: result = value.U16(); return true;
 				case Type::U32: result = value.U32(); return true;
 				case Type::U64: result = value.U64(); return true;
-				default: return Fail(error, "non-integer immediate in runtime expression");
+				case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
+				default: return Fail(error, "unsupported immediate in runtime expression");
 			}
 		}
 		auto* inst = value.TryInstruction();
@@ -473,8 +600,88 @@ private:
 
 	bool EvaluatePhi(const Inst& inst, uint64_t& result, std::string* error) {
 		const auto value = ResolveInvariantPhi(m_values, Value(const_cast<Inst*>(&inst)));
-		return !value.IsEmpty() ? EvaluateWide(value, result, error)
-		                        : Fail(error, "typed phi has runtime-dependent values");
+		if (!value.IsEmpty()) {
+			return EvaluateWide(value, result, error);
+		}
+		if (m_values.blocks.empty() || m_values.block_info.size() != m_values.blocks.size() ||
+		    inst.Parent() == nullptr) {
+			return Fail(error, "control-dependent phi has no complete CFG");
+		}
+
+		const auto find_target = [&](uint32_t id) -> const Block* {
+			const auto found = std::ranges::find_if(
+			    m_values.block_info, [&](const ValueBlockInfo& info) { return info.id == id; });
+			return found == m_values.block_info.end()
+			           ? nullptr
+			           : m_values.blocks[static_cast<size_t>(found - m_values.block_info.begin())];
+		};
+
+		const auto*                      target      = inst.Parent();
+		const auto*                      current     = m_values.blocks.front();
+		const Block*                     predecessor = nullptr;
+		std::unordered_set<const Block*> visited;
+		while (current != target) {
+			if (current == nullptr || !visited.insert(current).second) {
+				return Fail(error, "control-dependent phi selection entered a CFG cycle");
+			}
+			const auto found = std::ranges::find(m_values.blocks, current);
+			if (found == m_values.blocks.end()) {
+				return Fail(error, "control-dependent phi selection reached a foreign CFG block");
+			}
+			const auto& info =
+			    m_values.block_info[static_cast<size_t>(found - m_values.blocks.begin())];
+			uint32_t next = UINT32_MAX;
+			switch (info.terminator.kind) {
+				case CFG::TerminatorKind::Branch: next = info.terminator.true_block; break;
+				case CFG::TerminatorKind::ConditionalBranch: {
+					uint64_t condition = 0;
+					if (info.condition.IsEmpty() ||
+					    !EvaluateWide(info.condition, condition, error)) {
+						return false;
+					}
+					next =
+					    condition != 0u ? info.terminator.true_block : info.terminator.false_block;
+					break;
+				}
+				case CFG::TerminatorKind::IndirectBranch: {
+					uint64_t selector = 0;
+					if (info.indirect_target.IsEmpty() ||
+					    !EvaluateWide(info.indirect_target, selector, error)) {
+						return false;
+					}
+					const auto& values  = info.terminator.indirect_selector_code != UINT32_MAX
+					                          ? info.terminator.indirect_selector_values
+					                          : info.terminator.indirect_target_pcs;
+					const auto& targets = info.terminator.indirect_selector_code != UINT32_MAX
+					                          ? info.terminator.indirect_selector_targets
+					                          : info.terminator.indirect_targets;
+					for (size_t index = 0; index < std::min(values.size(), targets.size());
+					     index++) {
+						if (values[index] == static_cast<uint32_t>(selector)) {
+							next = targets[index];
+							break;
+						}
+					}
+					break;
+				}
+				default: break;
+			}
+			const auto* successor = find_target(next);
+			if (successor == nullptr) {
+				return Fail(error, "control-dependent phi path does not reach its merge block");
+			}
+			predecessor = current;
+			current     = successor;
+		}
+		if (predecessor == nullptr) {
+			return Fail(error, "control-dependent phi is located in the CFG entry block");
+		}
+		for (size_t index = 0; index < inst.NumArgs(); index++) {
+			if (inst.PhiBlock(index) == predecessor) {
+				return EvaluateWide(inst.Arg(index), result, error);
+			}
+		}
+		return Fail(error, "control-dependent phi has no operand for the selected CFG edge");
 	}
 
 	bool EvaluateExtract(const Inst& inst, uint64_t& result, std::string* error) {
@@ -585,6 +792,16 @@ private:
 		const auto ternary = [&]() {
 			return Arg(inst, 0, a, error) && Arg(inst, 1, b, error) && Arg(inst, 2, c, error);
 		};
+		const auto compare_f32 = [&](auto predicate, bool unordered_result) {
+			if (!binary()) {
+				return false;
+			}
+			const auto lhs       = std::bit_cast<float>(static_cast<uint32_t>(a));
+			const auto rhs       = std::bit_cast<float>(static_cast<uint32_t>(b));
+			const bool unordered = std::isunordered(lhs, rhs);
+			result               = unordered ? unordered_result : predicate(lhs, rhs);
+			return true;
+		};
 		switch (inst.GetOpcode()) {
 			case ValueOpcode::GetUserData: {
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
@@ -596,6 +813,19 @@ private:
 				return true;
 			}
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
+			case ValueOpcode::WqmMask:
+				if (Arg(inst, 0, a, error)) {
+					result = a != 0u;
+					return true;
+				}
+				return false;
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32:
+				if (Arg(inst, 0, a, error)) {
+					result = static_cast<uint32_t>(a);
+					return true;
+				}
+				return false;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result, error);
 			case ValueOpcode::CompositeExtractU64:
 			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result, error);
@@ -820,6 +1050,30 @@ private:
 					return true;
 				}
 				return false;
+			case ValueOpcode::FPOrdEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs == rhs; }, false);
+			case ValueOpcode::FPUnordEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs == rhs; }, true);
+			case ValueOpcode::FPOrdNotEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs != rhs; }, false);
+			case ValueOpcode::FPUnordNotEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs != rhs; }, true);
+			case ValueOpcode::FPOrdLessThan32:
+				return compare_f32([](float lhs, float rhs) { return lhs < rhs; }, false);
+			case ValueOpcode::FPUnordLessThan32:
+				return compare_f32([](float lhs, float rhs) { return lhs < rhs; }, true);
+			case ValueOpcode::FPOrdGreaterThan32:
+				return compare_f32([](float lhs, float rhs) { return lhs > rhs; }, false);
+			case ValueOpcode::FPUnordGreaterThan32:
+				return compare_f32([](float lhs, float rhs) { return lhs > rhs; }, true);
+			case ValueOpcode::FPOrdLessThanEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs <= rhs; }, false);
+			case ValueOpcode::FPUnordLessThanEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs <= rhs; }, true);
+			case ValueOpcode::FPOrdGreaterThanEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs >= rhs; }, false);
+			case ValueOpcode::FPUnordGreaterThanEqual32:
+				return compare_f32([](float lhs, float rhs) { return lhs >= rhs; }, true);
 			case ValueOpcode::LogicalAnd:
 				if (binary()) {
 					result = (a != 0u) && (b != 0u);

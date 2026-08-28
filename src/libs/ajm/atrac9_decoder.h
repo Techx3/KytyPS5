@@ -463,7 +463,19 @@ private:
 			const auto* chunk      = input + offset;
 			const auto  chunk_size = static_cast<size_t>(AjmReadLe32(chunk + 4));
 			const auto  payload    = offset + 8;
-			if (payload > input_size || chunk_size > input_size - payload) {
+
+			// A streaming WAV commonly declares the complete data-chunk size while only the first
+			// packet is available. The chunk header is sufficient to begin decoding; unlike
+			// metadata chunks, its full payload must not be required in the current input buffer.
+			if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
+				*data_offset                  = payload;
+				result->input_consumed        = payload;
+				result->format                = GetFormat();
+				result->total_decoded_samples = m_total_decoded_samples;
+				return true;
+			}
+
+			if (chunk_size > input_size - payload) {
 				result->result = AJM_RESULT_PARTIAL_INPUT;
 				return false;
 			}
@@ -495,12 +507,6 @@ private:
 					LOGF("AJM ATRAC9 gapless: total=%" PRIu32 ", skip=%" PRIu16 "\n",
 					     gapless_decode.total_samples, gapless_decode.skip_samples);
 				}
-			} else if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
-				*data_offset                  = payload;
-				result->input_consumed        = payload;
-				result->format                = GetFormat();
-				result->total_decoded_samples = m_total_decoded_samples;
-				return true;
 			}
 
 			const auto padded_size = chunk_size + (chunk_size & 1u);

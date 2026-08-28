@@ -10,9 +10,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
 class Translator {
 public:
 	Translator(IR::ValueProgram& program, IR::Block* block, uint32_t vector_limit,
-	           uint32_t wave_size)
+	           uint32_t wave_size, bool dx10_clamp, bool fp16_overflow)
 	    : value_program(program), ir(block), current_vector_limit(vector_limit),
-	      current_wave_size(wave_size) {}
+	      current_wave_size(wave_size), current_dx10_clamp(dx10_clamp),
+	      current_fp16_overflow(fp16_overflow) {}
 
 	bool TranslateBlock(const IR::BasicBlock& source, std::string* error);
 	bool AddBranchCondition(const IR::BasicBlock& source, IR::ValueBlockInfo& info,
@@ -30,7 +31,11 @@ private:
 	IR::Value              ReadOperand(const IR::Operand& operand, IR::Type type);
 	IR::U1                 ThreadBit(IR::U32 low);
 	void                   WriteRawU32(const IR::Operand& operand, IR::U32 value);
+	IR::F32                ApplyDx10Nan(IR::F32 value);
 	IR::F32                ApplyF32ResultModifiers(const IR::Operand& operand, IR::F32 value);
+	IR::F32                ApplyF16Overflow(IR::Opcode opcode, IR::F32 value,
+	                                       const std::array<IR::F32, 3>& args,
+	                                       uint32_t arg_count);
 	void                   WriteOperand(const IR::Operand& operand, IR::Value value);
 	IR::U32                PackHalf2x16(IR::F32 low, IR::F32 high);
 	void                   WriteF16(const IR::Operand& operand, IR::F32 value);
@@ -129,6 +134,8 @@ private:
 	uint32_t          current_pc           = 0;
 	uint32_t          current_vector_limit = 1;
 	uint32_t          current_wave_size    = 64;
+	bool              current_dx10_clamp    = false;
+	bool              current_fp16_overflow = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail

@@ -43,6 +43,18 @@ bool IsControlFlowBranch(Opcode opcode) {
 	}
 }
 
+bool IsCodeEndMarker(std::span<const uint32_t> code, uint32_t word_index) {
+	constexpr uint32_t code_end          = 0xbf9f0000u;
+	constexpr uint32_t marker_word_count = 5u;
+
+	if (word_index + marker_word_count > code.size()) {
+		return false;
+	}
+	return std::all_of(code.begin() + word_index,
+	                   code.begin() + word_index + marker_word_count,
+	                   [](uint32_t word) { return word == code_end; });
+}
+
 void ApplyLiteral(Operand& operand, uint32_t literal) {
 	if (operand.kind == OperandKind::LiteralConstant) {
 		operand.value      = literal;
@@ -407,6 +419,12 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
+		// S_CODE_END is padding for shader-buffer analysis, not executable shader code. The ISA
+		// requires five consecutive encodings so a literal or a multi-DWORD instruction cannot be
+		// mistaken for the marker.
+		if (IsCodeEndMarker(code, word_index)) {
+			return true;
+		}
 		program.instructions.emplace_back();
 		if (!DecodeInstruction(code, word_index, program.instructions.back(), error)) {
 			program.instructions.pop_back();
@@ -612,6 +630,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::TBUFFER_STORE_FORMAT_XYZ:
 		case Opcode::TBUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_ATOMIC_SWAP:
+		case Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Opcode::BUFFER_ATOMIC_ADD:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
@@ -661,6 +680,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
+		case Opcode::DS_BPERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:
 		case Opcode::DS_READ_I16:

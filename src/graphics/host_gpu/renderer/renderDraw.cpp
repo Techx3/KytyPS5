@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -62,6 +63,12 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 	}
 
 	return 0;
+}
+
+bool IsGeControlGroupSizeValid(uint16_t primitive_group_size, uint16_t vertex_group_size) {
+	constexpr uint16_t GeControlGroupSizeMask = 0x01ff;
+	return primitive_group_size <= GeControlGroupSizeMask &&
+	       vertex_group_size <= GeControlGroupSizeMask;
 }
 
 static std::atomic<uint32_t> g_draw_state_log_count   = 0;
@@ -446,23 +453,87 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	                                 vertex_info.gs_regs.chksum != 0 &&
 	                                 sh_regs.m_vgtGsMaxVertOut == 0x00000000 &&
 	                                 is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType);
+	// A legacy ES-only stage mask is also a vertex-only export path when no geometry is
+	// amplified. Compile its ES program as the Vulkan vertex shader just like the NGG form.
+	const bool ps5_export_vertex_path =
+	    stages == 0x00002000 && vertex_info.es_regs.data_addr != 0 &&
+	    vertex_info.gs_regs.chksum != 0 && sh_regs.m_geNggSubgrpCntl <= 0x00000001 &&
+	    sh_regs.m_vgtGsMaxVertOut == 0x00000000 &&
+	    is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType) &&
+	    sh_regs.m_geMaxOutputPerSubgroup <= 0x00000040;
+	// AGC also emits regular triangle draws through the NGG passthrough path. Kyty recompiles the
+	// ES program as a Vulkan vertex shader, so this form is equivalent to the vertex-only path when
+	// ES and GS point at the same program and the fixed passthrough register tuple is present.
+	const bool ps5_ngg_passthrough_triangle_path =
+	    stages == 0x02002000 && vertex_info.es_regs.data_addr != 0 &&
+	    vertex_info.gs_regs.data_addr == vertex_info.es_regs.data_addr &&
+	    vertex_info.gs_regs.chksum != 0 && sh_regs.m_geNggSubgrpCntl == 0x00000001 &&
+	    sh_regs.m_vgtGsMaxVertOut == 0x00000003 &&
+	    sh_regs.m_vgtGsOutPrimType ==
+	        static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kTriangles) &&
+	    sh_regs.m_geMaxOutputPerSubgroup <= 0x000000c0;
+	// Split GsFront/GsBack binaries use the legacy ES/GS stage mask. For a one-triangle NGG
+	// pipeline the front half still contains the vertex work consumed by Kyty's VS recompiler;
+	// accepting this exact tuple preserves the base geometry while the fixed primitive-export
+	// back half is represented by Vulkan's triangle assembly.
+	const bool ps5_ngg_split_triangle_path =
+	    stages == 0x00002030 && vertex_info.es_regs.data_addr != 0 &&
+	    vertex_info.gs_regs.data_addr != 0 &&
+	    vertex_info.gs_regs.data_addr != vertex_info.es_regs.data_addr &&
+	    vertex_info.gs_regs.chksum != 0 && sh_regs.m_geNggSubgrpCntl == 0x00000001 &&
+	    sh_regs.m_vgtGsMaxVertOut == 0x00000003 &&
+	    sh_regs.m_vgtGsOutPrimType ==
+	        static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kTriangles) &&
+	    sh_regs.m_geMaxOutputPerSubgroup == 0x000000c0;
+	// SDK 10 fused GsFront/GsBack shaders with real amplification use a larger NGG tuple. The
+	// recompiler accepts this path only after proving and linking its LDS hand-off.
+	const bool ps5_ngg_linked_geometry_path =
+	    stages == 0x00002030 && vertex_info.es_regs.data_addr != 0 &&
+	    vertex_info.gs_regs.data_addr != 0 &&
+	    vertex_info.gs_regs.data_addr != vertex_info.es_regs.data_addr &&
+	    vertex_info.gs_regs.chksum != 0 && sh_regs.m_geNggSubgrpCntl > 0x00000001 &&
+	    sh_regs.m_geNggSubgrpCntl <= 0x00000040 && sh_regs.m_vgtGsMaxVertOut > 0x00000003 &&
+	    sh_regs.m_vgtGsMaxVertOut <= 0x00000100 &&
+	    sh_regs.m_vgtGsOutPrimType ==
+	        static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kTriangles) &&
+	    sh_regs.m_geMaxOutputPerSubgroup > 0x000000c0 &&
+	    sh_regs.m_geMaxOutputPerSubgroup <= 0x00000400;
+	const bool supported_ge_path =
+	    ps5_ngg_vertex_path || ps5_export_vertex_path || ps5_ngg_passthrough_triangle_path ||
+	    ps5_ngg_split_triangle_path || ps5_ngg_linked_geometry_path;
+	const bool ps5_ngg_triangle_path =
+	    ps5_ngg_passthrough_triangle_path || ps5_ngg_split_triangle_path ||
+	    ps5_ngg_linked_geometry_path;
 
-	const bool unsupported_stage_mask = (stages != 0 && stages != 0x02002000);
+	const bool unsupported_stage_mask =
+	    (stages != 0 && stages != 0x02002000 && !ps5_export_vertex_path &&
+	     !ps5_ngg_split_triangle_path && !ps5_ngg_linked_geometry_path);
 	const bool unsupported_gs_stage = (vertex_info.es_regs.data_addr != 0 &&
-	                                   vertex_info.gs_regs.data_addr != 0 && !ps5_ngg_vertex_path);
-	const bool ge_group_size =
-	    ge_cntl.primitive_group_size > 0x0040 || ge_cntl.vertex_group_size > 0x0040;
+	                                   vertex_info.gs_regs.data_addr != 0 && !supported_ge_path);
+	const bool ge_group_size = !IsGeControlGroupSizeValid(ge_cntl.primitive_group_size,
+	                                                     ge_cntl.vertex_group_size);
 	const bool ge_shader_regs =
-	    (sh_regs.m_geNggSubgrpCntl != 0x00000000 && sh_regs.m_geNggSubgrpCntl != 0x00000001) ||
-	    sh_regs.m_vgtGsMaxVertOut != 0x00000000 ||
+	    (!ps5_ngg_linked_geometry_path && sh_regs.m_geNggSubgrpCntl != 0x00000000 &&
+	     sh_regs.m_geNggSubgrpCntl != 0x00000001) ||
+	    (!supported_ge_path && sh_regs.m_vgtGsMaxVertOut != 0x00000000) ||
 	    !is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType) ||
-	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
+	    (!ps5_ngg_triangle_path &&
+	     sh_regs.m_geMaxOutputPerSubgroup > 0x00000040);
 
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
 		static std::once_flag warning_once;
-		std::call_once(warning_once, [] {
+		std::call_once(warning_once, [&] {
 			std::printf("Warning: game uses unsupported graphics pipelines; some draw calls were "
-			            "skipped.\n");
+			            "skipped: stages=0x%08" PRIx32 " prim_group=0x%04" PRIx16
+			            " vert_group=0x%04" PRIx16 " ngg=0x%08" PRIx32
+			            " max_out=0x%08" PRIx32 " gs_max_vert=0x%08" PRIx32
+			            " gs_out_prim=0x%08" PRIx32
+			            " reasons=stage:%u,gs:%u,group:%u,regs:%u.\n",
+			            stages, ge_cntl.primitive_group_size, ge_cntl.vertex_group_size,
+			            sh_regs.m_geNggSubgrpCntl, sh_regs.m_geMaxOutputPerSubgroup,
+			            sh_regs.m_vgtGsMaxVertOut, sh_regs.m_vgtGsOutPrimType,
+			            unsupported_stage_mask ? 1u : 0u, unsupported_gs_stage ? 1u : 0u,
+			            ge_group_size ? 1u : 0u, ge_shader_regs ? 1u : 0u);
 		});
 
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
@@ -470,11 +541,15 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32
 			     " prim_group=0x%04" PRIx16 " vert_group=0x%04" PRIx16 " ngg=0x%08" PRIx32
 			     " max_out=0x%08" PRIx32 " gs_max_vert=0x%08" PRIx32 " gs_out_prim=0x%08" PRIx32
-			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
+			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 " checksum=0x%016" PRIx64
+			     " reasons=stage:%u,gs:%u,group:%u,regs:%u\n",
 			     stages, ge_cntl.primitive_group_size, ge_cntl.vertex_group_size,
 			     sh_regs.m_geNggSubgrpCntl, sh_regs.m_geMaxOutputPerSubgroup,
 			     sh_regs.m_vgtGsMaxVertOut, sh_regs.m_vgtGsOutPrimType,
-			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr);
+			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr,
+			     vertex_info.gs_regs.chksum, unsupported_stage_mask ? 1u : 0u,
+			     unsupported_gs_stage ? 1u : 0u, ge_group_size ? 1u : 0u,
+			     ge_shader_regs ? 1u : 0u);
 		}
 		return true;
 	}
@@ -614,11 +689,20 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, target.samples);
 		}
-		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
-		                                            : vk::ImageLayout::eColorAttachmentOptimal;
-		const auto  access =
-		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+		const auto& view = target.desc.view_info;
+		const bool feedback_loop = m_context.GetGraphics().attachment_feedback_loop_enabled &&
+		                           image.binding.is_bound && !image.binding.shader_write;
+		const auto layout = feedback_loop
+		                        ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		                        : (image.binding.is_bound ? vk::ImageLayout::eGeneral
+		                                                  : vk::ImageLayout::eColorAttachmentOptimal);
+		auto access = vk::AccessFlags2 {vk::AccessFlagBits2::eColorAttachmentRead |
+		                               vk::AccessFlagBits2::eColorAttachmentWrite};
+		if (feedback_loop) {
+			access |= vk::AccessFlagBits2::eShaderRead;
+			image.binding.feedback_loop = true;
+			state.color_feedback_loop = true;
+		}
 		AppendBarriers(
 		    image.GetBarriers(layout, access, Image::DestinationStages(access),
 		                      ImageSubresourceRange {view.base_level, view.level_count,
@@ -671,11 +755,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.samples);
 		}
-		const auto layout = depth_attachment_layout(depth);
 		const auto writes = depth.AttachmentWriteAspects();
+		const bool feedback_loop = m_context.GetGraphics().attachment_feedback_loop_enabled &&
+		                           image.binding.is_bound && !image.binding.shader_write && writes;
+		const auto layout = feedback_loop ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		                                  : depth_attachment_layout(depth);
 		auto       access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead};
 		if (writes) {
 			access |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		}
+		if (feedback_loop) {
+			access |= vk::AccessFlagBits2::eShaderRead;
+			image.binding.feedback_loop = true;
+			state.depth_feedback_loop = true;
 		}
 		const auto& view = depth.desc.view_info;
 		AppendBarriers(
@@ -1023,8 +1115,18 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	state.ps_input_info = {};
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
+	std::array<ShaderMrtOutputType, RENDER_COLOR_ATTACHMENTS_MAX> target_output_types {};
+	const auto OutputType = [](Prospero::ChannelType type) {
+		switch (type) {
+			case Prospero::ChannelType::kUInt: return ShaderMrtOutputType::Uint;
+			case Prospero::ChannelType::kSInt: return ShaderMrtOutputType::Sint;
+			default: return ShaderMrtOutputType::Float;
+		}
+	};
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		target_export_mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
+		const auto slot = state.color_info[i].target_slot;
+		target_export_mapping[slot] = state.color_info[i].export_mapping;
+		target_output_types[slot] = OutputType(ctx.GetRenderTarget(slot).info.channel_type);
 	}
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoVS");
@@ -1041,7 +1143,8 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
 	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, state.vs_input_info,
-	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
+	                         target_export_mapping, state.ps_input_info, state.ps_shader,
+	                         buffer.GetGraphics().subgroup_size, &target_output_types)) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}
 }
@@ -1196,13 +1299,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	}
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    state.color_info, state.color_count, state.depth_info, state.vs_input_info, buffer,
-	    &state.ps_input_info, topology, primitive_restart_enable, state.ps_active, state.vs_shader,
+	    &state.ps_input_info, topology, primitive_restart_enable, state.ps_active,
+	    state.rendering.color_feedback_loop, state.rendering.depth_feedback_loop, state.vs_shader,
 	    state.ps_shader);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
-	auto vk_buffer = buffer.Handle();
+	auto           vk_buffer  = buffer.Handle();
+	const uint64_t vs_hash    = state.vs_input_info.stage.program->shader_hash;
+	const uint64_t ps_hash    = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+	const uint64_t color_addr = state.color_count != 0 ? state.color_info[0].base_addr : 0;
+	const auto     vs_images  = Config::VulkanDebugMarkersEnabled()
+	                               ? DescribeImageBindings(bindings.vertex,
+	                                                       m_context.GetTextureCache())
+	                               : std::string {};
+	const auto     ps_images  = Config::VulkanDebugMarkersEnabled() && bindings.pixel.has_value()
+	                               ? DescribeImageBindings(*bindings.pixel,
+	                                                       m_context.GetTextureCache())
+	                               : std::string {};
+	ScopedVulkanDebugLabel draw_label(
+	    vk_buffer, std::array {0.18f, 0.55f, 0.95f, 1.0f},
+	    "Kyty.{} submit={} frame={} VS=0x{:016x} PS=0x{:016x} RT0=0x{:016x} "
+	    "DS=0x{:016x} extent={}x{} count={} instances={} VSI={} PSI={}",
+	    draw.name, submit_id, m_context.GetGpu().GetFrameNum(), vs_hash, ps_hash, color_addr,
+	    state.depth_info.depth_buffer_vaddr, state.rendering.width, state.rendering.height,
+	    draw.index_count, draw.instance_count, vs_images, ps_images);
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
 	}
@@ -1285,10 +1407,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		buffer.MarkOcclusionConservativeVisible();
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		buffer.MarkOcclusionConservativeVisible();
 		return;
 	}
 
@@ -1318,6 +1442,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, false, topology)) {
+		buffer.MarkOcclusionConservativeVisible();
 		return;
 	}
 
@@ -1370,6 +1495,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, true, state)) {
+		buffer.MarkOcclusionConservativeVisible();
 		ResetBindings();
 		return;
 	}
@@ -1416,10 +1542,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		buffer.MarkOcclusionConservativeVisible();
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		buffer.MarkOcclusionConservativeVisible();
 		return;
 	}
 
@@ -1451,12 +1579,14 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, false,
 	                            state)) {
+		buffer.MarkOcclusionConservativeVisible();
 		ResetBindings();
 		return;
 	}
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
+		buffer.MarkOcclusionConservativeVisible();
 		ResetBindings();
 		return;
 	}
@@ -1465,6 +1595,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
+		buffer.MarkOcclusionConservativeVisible();
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
 			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",

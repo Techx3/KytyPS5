@@ -179,6 +179,24 @@ bool LowerBufferAtomicDword(const Decoder::Instruction& decoded, BasicBlock& blo
 	return true;
 }
 
+bool LowerBufferAtomicCompareSwap(const Decoder::Instruction& decoded, BasicBlock& block,
+                                  std::string* error) {
+	Instruction inst;
+	inst.pc       = decoded.pc;
+	inst.op       = Opcode::AtomicCompareSwapU32;
+	inst.memory   = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	inst.dst.kind = OperandKind::Null;
+	// BUFFER_ATOMIC_CMPSWAP stores the replacement in VDATA and the comparator in VDATA+1.
+	if ((decoded.glc && !LowerRegisterOperand(decoded.dst, inst.dst, error)) ||
+	    !LowerSourceOperand(decoded.dst, inst.src[0], error) ||
+	    !LowerSourceOperand(OffsetDecodedRegister(decoded.dst, 1), inst.src[1], error) ||
+	    !LowerBufferAddressSources(decoded, inst, 2, error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
 	return decoded.gds ? ResourceKind::Gds : ResourceKind::Lds;
 }
@@ -240,6 +258,23 @@ bool LowerDsSwizzleB32(const Decoder::Instruction& decoded, BasicBlock& block, s
 	inst.src[1].imm  = decoded.offset & 0xffffu;
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
 	    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
+bool LowerDsBpermuteB32(const Decoder::Instruction& decoded, BasicBlock& block,
+	                     std::string* error) {
+	Instruction inst;
+	inst.pc          = decoded.pc;
+	inst.op          = Opcode::DsBpermuteB32;
+	inst.src_count   = 3;
+	inst.src[2].kind = OperandKind::ImmediateU32;
+	inst.src[2].imm  = decoded.offset & 0xffffu;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerSourceOperand(decoded.src1, inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[1], error)) {
 		return false;
 	}
 	block.instructions.push_back(inst);
@@ -529,6 +564,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 			return LowerBufferStore(decoded, block, error);
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSwapU32, error);
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP:
+			return LowerBufferAtomicCompareSwap(decoded, block, error);
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAddU32, error);
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
@@ -608,6 +645,7 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 		case Decoder::Opcode::DS_MAX_F32:
 			return LowerDsFloatMinMaxF32(decoded, block, Opcode::DsMaxF32, error);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return LowerDsSwizzleB32(decoded, block, error);
+		case Decoder::Opcode::DS_BPERMUTE_B32: return LowerDsBpermuteB32(decoded, block, error);
 		case Decoder::Opcode::DS_CONSUME:
 			return LowerDsAppendConsume(decoded, block, Opcode::DsConsume, error);
 		case Decoder::Opcode::DS_APPEND:
@@ -625,6 +663,7 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
 		case Decoder::Opcode::DS_READ_U16_D16:
+		case Decoder::Opcode::DS_READ_U16_D16_HI:
 		case Decoder::Opcode::DS_READ_B32:
 		case Decoder::Opcode::DS_READ_B64:
 		case Decoder::Opcode::DS_READ_B96:
@@ -711,6 +750,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
 		case Decoder::Opcode::BUFFER_ATOMIC_SMIN:
@@ -758,6 +798,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::DS_MIN_F32:
 		case Decoder::Opcode::DS_MAX_F32:
 		case Decoder::Opcode::DS_SWIZZLE_B32:
+		case Decoder::Opcode::DS_BPERMUTE_B32:
 		case Decoder::Opcode::DS_CONSUME:
 		case Decoder::Opcode::DS_APPEND:
 		case Decoder::Opcode::DS_READ_I8:
@@ -765,6 +806,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
 		case Decoder::Opcode::DS_READ_U16_D16:
+		case Decoder::Opcode::DS_READ_U16_D16_HI:
 		case Decoder::Opcode::DS_READ2_B32:
 		case Decoder::Opcode::DS_READ2ST64_B32:
 		case Decoder::Opcode::DS_READ_B32:

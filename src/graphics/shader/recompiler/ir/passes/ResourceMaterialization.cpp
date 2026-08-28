@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
@@ -58,9 +59,50 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
 		return false;
 	}
+	const auto bytes = Prospero::NumBytesPerElement(format);
+	if (!std::has_single_bit(bytes) && Prospero::BlockCompressedBytesPerBlock(format) == 0u) {
+		return false;
+	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
+	}
+	const auto tile = static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu);
+	const bool supported_tile =
+	    tile == Prospero::TileMode::kLinear || tile == Prospero::TileMode::kStandard256B ||
+	    tile == Prospero::TileMode::kStandard4KB || tile == Prospero::TileMode::kStandard64KB ||
+	    tile == Prospero::TileMode::kPrt || tile == Prospero::TileMode::kDepth ||
+	    tile == Prospero::TileMode::kRenderTarget;
+	if (!supported_tile ||
+	    (type == Prospero::ImageType::kColor3D && tile != Prospero::TileMode::kLinear &&
+	     tile != Prospero::TileMode::kStandard4KB && tile != Prospero::TileMode::kStandard64KB &&
+	     tile != Prospero::TileMode::kPrt)) {
+		return false;
+	}
+	if (!r128) {
+		if ((descriptor.dwords[4] & 0xe000e000u) != 0u) {
+			return false;
+		}
+		const auto depth      = descriptor.dwords[4] & 0x1fffu;
+		const auto base_array = (descriptor.dwords[4] >> 16u) & 0x1fffu;
+		switch (type) {
+			case Prospero::ImageType::kColor1D:
+			case Prospero::ImageType::kColor2D:
+			case Prospero::ImageType::kColor2DMsaa:
+				if (depth != 0u || base_array != 0u) {
+					return false;
+				}
+				break;
+			case Prospero::ImageType::kCube:
+			case Prospero::ImageType::kColor1DArray:
+			case Prospero::ImageType::kColor2DArray:
+			case Prospero::ImageType::kColor2DMsaaArray:
+				if (base_array > depth) {
+					return false;
+				}
+				break;
+			default: break;
+		}
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
 	    type == Prospero::ImageType::kColor2DMsaaArray) {
@@ -70,6 +112,19 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
 		       (r128 || max_mip == fragments);
 	}
+	const auto width =
+	    (((descriptor.dwords[1] >> 30u) & 0x3u) | ((descriptor.dwords[2] & 0xfffu) << 2u)) + 1u;
+	const auto height = ((descriptor.dwords[2] >> 14u) & 0x3fffu) + 1u;
+	const auto depth  = (descriptor.dwords[4] & 0x1fffu) + 1u;
+	const auto maximum_dimension = std::max(
+	    width, type == Prospero::ImageType::kColor1D || type == Prospero::ImageType::kColor1DArray
+	               ? 1u
+	               : std::max(height, type == Prospero::ImageType::kColor3D ? depth : 1u));
+	const auto max_mip =
+	    r128 ? (descriptor.dwords[3] >> 16u) & 0xfu : (descriptor.dwords[5] >> 4u) & 0xfu;
+	if (max_mip >= std::bit_width(maximum_dimension)) {
+		return false;
+	}
 	return true;
 }
 
@@ -77,14 +132,25 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
-Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
-	return Prospero::RemapTextureFormat(format) != format ? format
-	                                                     : Prospero::BufferFormat::kInvalid;
+Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format, bool storage) {
+	const auto backing_format = storage ? Prospero::RemapTextureFormat(format)
+	                                    : Prospero::RemapSampledTextureFormat(format);
+	return backing_format != format ? format : Prospero::BufferFormat::kInvalid;
 }
 
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	return static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
 	       Prospero::ImageType::kCube;
+}
+
+bool CompatibleIndirectImageKinds(const ImageResource& lhs, const ImageResource& rhs) {
+	if (lhs.kind == rhs.kind) {
+		return true;
+	}
+	const auto sampled = [](ResourceKind kind) {
+		return kind == ResourceKind::Image || kind == ResourceKind::ImageUint;
+	};
+	return !lhs.depth_compare && !rhs.depth_compare && sampled(lhs.kind) && sampled(rhs.kind);
 }
 
 uint32_t StorageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
@@ -255,6 +321,121 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate)) {
 			candidate.dwords.fill(0);
 		}
+		const auto found = std::ranges::find(next.descriptors, candidate);
+		if (found == next.descriptors.end()) {
+			next.descriptors.push_back(candidate);
+			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
+		} else {
+			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
+		}
+	}
+	result = std::move(next);
+	return true;
+}
+
+bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indirect,
+                                    const DescriptorValue& table_value,
+                                    const DescriptorValue* entry_count_value,
+                                    const SrtRuntime& runtime,
+                                    ResourceSnapshot::IndirectImage& result, std::string* error,
+                                    uint32_t use_pc) {
+	uint32_t entry_count = indirect.entry_count;
+	if (indirect.entry_count_source != DescriptorSource::IndirectImage::NoEntryCountSource) {
+		if (entry_count_value == nullptr || entry_count_value->dword_count != 1u) {
+			if (error != nullptr) {
+				*error = fmt::format(
+				    "direct indirect image table at pc 0x{:08x} has no runtime entry count",
+				    use_pc);
+			}
+			return false;
+		}
+		entry_count = entry_count_value->dwords[0];
+	}
+	// Dense image bindings currently support at most 32 distinct direct-table entries. Reject a
+	// larger runtime loop bound instead of silently mapping out-of-range keys to entry zero.
+	if (table_value.dword_count != 2u || indirect.selector_stride != 32u ||
+	    entry_count > ShaderInfo::MaxImages) {
+		if (error != nullptr) {
+			*error = fmt::format("direct indirect image table at pc 0x{:08x} has invalid layout",
+			                     use_pc);
+		}
+		return false;
+	}
+	const auto base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u |
+	                   table_value.dwords[0]) &
+	                  AddressMask;
+
+	ResourceSnapshot::IndirectImage next;
+	std::vector<uint32_t> keys;
+	if (indirect.direct_key_count != 0u) {
+		std::unordered_set<uint32_t> seen;
+		for (uint32_t entry = 0; entry < indirect.direct_key_count; entry++) {
+			const auto key_offset = static_cast<uint64_t>(indirect.direct_key_offset) +
+			                        static_cast<uint64_t>(entry) * indirect.direct_key_stride;
+			if (key_offset > AddressMask - base) {
+				if (error != nullptr) {
+					*error = fmt::format("direct indirect image key table at pc 0x{:08x} exceeds "
+					                     "the 48-bit address space",
+					                     use_pc);
+				}
+				return false;
+			}
+			uint32_t key = 0;
+			if (!ReadSpecializationWord(runtime, base + key_offset, key)) {
+				if (error != nullptr) {
+					*error = fmt::format("direct indirect image key table at pc 0x{:08x} failed "
+					                     "at 0x{:016x}",
+					                     use_pc, base + key_offset);
+				}
+				return false;
+			}
+			if (static_cast<int32_t>(key) >= 0 && seen.insert(key).second) {
+				keys.push_back(key);
+			}
+		}
+		next.capacity = indirect.direct_key_count;
+	} else {
+		// A zero bound makes the sample block unreachable, but the pipeline still needs one typed
+		// descriptor. Entry zero supplies that type without changing execution semantics.
+		entry_count = std::max(entry_count, 1u);
+		keys.resize(entry_count);
+		std::iota(keys.begin(), keys.end(), 0u);
+		next.capacity = entry_count;
+	}
+	if (keys.empty()) {
+		keys.push_back(0u);
+		next.capacity = std::max(next.capacity, 1u);
+	}
+	for (const auto key: keys) {
+		DescriptorValue candidate;
+		candidate.dword_count = 8u;
+		const auto entry_offset = static_cast<uint64_t>(indirect.selector_offset) +
+		                          static_cast<uint64_t>(key) * indirect.selector_stride;
+		if (entry_offset > AddressMask - base ||
+		    entry_offset + (candidate.dword_count - 1u) * sizeof(uint32_t) >
+		        AddressMask - base) {
+			if (error != nullptr) {
+				*error = fmt::format("direct indirect image table at pc 0x{:08x} exceeds the "
+				                     "48-bit address space",
+				                     use_pc);
+			}
+			return false;
+		}
+		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+			const auto address = base + entry_offset + dword * sizeof(uint32_t);
+			if (!ReadSpecializationWord(runtime, address, candidate.dwords[dword])) {
+				if (error != nullptr) {
+					*error = fmt::format("direct indirect image table at pc 0x{:08x} failed at "
+					                     "0x{:016x}",
+					                     use_pc, address);
+				}
+				return false;
+			}
+		}
+		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate)) {
+			candidate.dwords.fill(0u);
+		}
+		next.keys.push_back(key);
 		const auto found = std::ranges::find(next.descriptors, candidate);
 		if (found == next.descriptors.end()) {
 			next.descriptors.push_back(candidate);
@@ -481,13 +662,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 			if (image.atomic && format != Prospero::BufferFormat::k32UInt) {
 				if (error != nullptr) {
-					*error = fmt::format(
-					    "atomic image descriptor {} changed to unsupported format {}", i,
-					    static_cast<uint32_t>(format));
+					*error =
+					    fmt::format("atomic image descriptor {} changed to unsupported format {}",
+					                i, static_cast<uint32_t>(format));
 				}
 				return false;
 			}
-			const auto conversion_format = ImageConversionFormat(format);
+			const auto conversion_format = ImageConversionFormat(format, storage);
 			if (image.conversion_format != conversion_format) {
 				if (error != nullptr) {
 					*error = fmt::format("image descriptor {} changed format conversion", i);
@@ -501,13 +682,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
-			const bool raw_sint_storage =
-			    storage && format == Prospero::BufferFormat::k32SInt && image.written &&
-			    !image.read && !image.atomic;
+			const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
+			                              image.written && !image.read && !image.atomic;
+			const bool sampled_sint = !storage && Prospero::IsSampledSintTextureFormat(format);
 			const bool uint_descriptor =
-			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-			const auto uint_program = image.kind == ResourceKind::ImageUint ||
-			                          image.kind == ResourceKind::StorageImageUint;
+			    Prospero::IsUintTextureFormat(format) || sampled_sint || raw_sint_storage;
+			const auto uint_program     = image.kind == ResourceKind::ImageUint ||
+			                              image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
 				if (error != nullptr) {
 					*error = fmt::format(
@@ -568,8 +749,16 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			}
 			MarkCleanFlatSlots(program, Source(program, source->indirect_image->material_source),
 			                   clean_flat_slots);
-			MarkCleanFlatSlots(program, Source(program, source->indirect_image->heap_source),
-			                   clean_flat_slots);
+			if (source->indirect_image->entry_count_source !=
+			    DescriptorSource::IndirectImage::NoEntryCountSource) {
+				MarkCleanFlatSlots(
+				    program, Source(program, source->indirect_image->entry_count_source),
+				    clean_flat_slots);
+			}
+			if (!source->indirect_image->direct_address) {
+				MarkCleanFlatSlots(program, Source(program, source->indirect_image->heap_source),
+				                   clean_flat_slots);
+			}
 		} else {
 			requests.push_back({image.source, image.first_use_pc});
 		}
@@ -612,21 +801,35 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			    image.indirect_root != image_index) {
 				continue;
 			}
-			const std::array requests {
-			    DescriptorSourceRequest {source->indirect_image->material_source,
-			                             image.first_use_pc},
-			    DescriptorSourceRequest {source->indirect_image->heap_source, image.first_use_pc}};
+			std::vector<DescriptorSourceRequest> requests {{
+			    source->indirect_image->material_source, image.first_use_pc}};
+			const bool dynamic_direct_count =
+			    source->indirect_image->direct_address &&
+			    source->indirect_image->entry_count_source !=
+			        DescriptorSource::IndirectImage::NoEntryCountSource;
+			if (dynamic_direct_count) {
+				requests.push_back(
+				    {source->indirect_image->entry_count_source, image.first_use_pc});
+			} else if (!source->indirect_image->direct_address) {
+				requests.push_back(
+				    {source->indirect_image->heap_source, image.first_use_pc});
+			}
 			SrtRuntime clean_runtime  = runtime;
 			clean_runtime.read_memory = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables, error)) {
 				return false;
 			}
-			const auto&                     material = tables[0];
-			const auto&                     heap     = tables[1];
 			ResourceSnapshot::IndirectImage table;
-			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, runtime, table,
-			                              error, image.first_use_pc)) {
+			const bool materialized = source->indirect_image->direct_address
+			                              ? MaterializeDirectIndirectImage(
+			                                    *source->indirect_image, tables[0],
+			                                    dynamic_direct_count ? &tables[1] : nullptr, runtime,
+			                                    table, error, image.first_use_pc)
+			                              : MaterializeIndirectImage(
+			                                    *source->indirect_image, tables[0], tables[1], runtime,
+			                                    table, error, image.first_use_pc);
+			if (!materialized) {
 				return false;
 			}
 			if (image.indirect_root == ImageResource::NoIndirectImage) {
@@ -844,15 +1047,17 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			}
 			return false;
 		}
-		const bool storage = image.kind == ResourceKind::StorageImage ||
-		                     image.kind == ResourceKind::StorageImageUint;
-		image.conversion_format = ImageConversionFormat(format);
+		const bool storage      = image.kind == ResourceKind::StorageImage ||
+		                          image.kind == ResourceKind::StorageImageUint;
+		image.conversion_format = ImageConversionFormat(format, storage);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              image.written && !image.read && !image.atomic;
-		const bool uint_image = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+		const bool sampled_sint = !storage && Prospero::IsSampledSintTextureFormat(format);
+		const bool uint_image =
+		    Prospero::IsUintTextureFormat(format) || sampled_sint || raw_sint_storage;
 		if (uint_image) {
 			switch (image.kind) {
 				case ResourceKind::Image: image.kind = ResourceKind::ImageUint; break;
@@ -909,17 +1114,34 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
+			if (!CompatibleIndirectImageKinds(image_class, image) ||
 			    image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.depth_compare != image_class.depth_compare ||
-			    image.cube != image_class.cube) {
+			    image.depth_compare != image_class.depth_compare) {
 				if (error != nullptr) {
 					*error = fmt::format(
-					    "indirect image table at pc 0x{:08x} has incompatible candidates",
-					    root.first_use_pc);
+					    "indirect image table at pc 0x{:08x} has incompatible candidates: "
+					    "exemplar={} candidate={} kind={}/{} dimension={}/{} mip_mode={}/{} "
+					    "mip_count={}/{} conversion_format={}/{} shader_swizzle=0x{:08x}/"
+					    "0x{:08x} depth_compare={}/{} cube={}/{} descriptor=[{:08x},"
+					    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}]",
+					    root.first_use_pc, exemplar, candidate,
+					    static_cast<uint32_t>(image_class.kind), static_cast<uint32_t>(image.kind),
+					    static_cast<uint32_t>(image_class.dimension),
+					    static_cast<uint32_t>(image.dimension),
+					    static_cast<uint32_t>(image_class.mip_mode),
+					    static_cast<uint32_t>(image.mip_mode), image_class.mip_count,
+					    image.mip_count, static_cast<uint32_t>(image_class.conversion_format),
+					    static_cast<uint32_t>(image.conversion_format), image_class.shader_swizzle,
+					    image.shader_swizzle, image_class.depth_compare, image.depth_compare,
+					    image_class.cube, image.cube, next_snapshot.images[candidate].dwords[0],
+					    next_snapshot.images[candidate].dwords[1],
+					    next_snapshot.images[candidate].dwords[2],
+					    next_snapshot.images[candidate].dwords[3],
+					    next_snapshot.images[candidate].dwords[4],
+					    next_snapshot.images[candidate].dwords[5],
+					    next_snapshot.images[candidate].dwords[6],
+					    next_snapshot.images[candidate].dwords[7]);
 				}
 				return false;
 			}
@@ -937,6 +1159,30 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		bool native     = false;
 		bool point_only = false;
 	};
+	const auto ImageSamplerUsage = [&](uint32_t image_index) {
+		SamplerUsage usage;
+		if (image_index >= next.images.size()) {
+			return usage;
+		}
+		const auto& image = next.images[image_index];
+		const auto AddImage = [&](uint32_t resource) {
+			if (resource >= next.images.size()) {
+				return;
+			}
+			const bool converted =
+			    next.images[resource].conversion_format != Prospero::BufferFormat::kInvalid;
+			usage.point_only |= converted;
+			usage.native |= !converted;
+		};
+		if (image.indirect_root == image_index && !image.indirect_resources.empty()) {
+			for (const auto resource: image.indirect_resources) {
+				AddImage(resource);
+			}
+		} else {
+			AddImage(image_index);
+		}
+		return usage;
+	};
 	std::vector<SamplerUsage> sampler_usage(next.samplers.size());
 	for (const auto& pair: next.sampled_pairs) {
 		if (pair.image >= next.images.size() || pair.sampler >= next.samplers.size()) {
@@ -947,11 +1193,9 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			return false;
 		}
 		auto& usage = sampler_usage[pair.sampler];
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
-			usage.point_only = true;
-		} else {
-			usage.native = true;
-		}
+		const auto image_usage = ImageSamplerUsage(pair.image);
+		usage.point_only |= image_usage.point_only;
+		usage.native |= image_usage.native;
 	}
 	std::vector<uint32_t> point_sampler(next.samplers.size(), UINT32_MAX);
 	for (uint32_t i = 0; i < sampler_usage.size(); i++) {
@@ -976,7 +1220,8 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		next_snapshot.samplers.push_back(next_snapshot.samplers[i]);
 	}
 	for (auto& pair: next.sampled_pairs) {
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
+		const auto usage = ImageSamplerUsage(pair.image);
+		if (usage.point_only && !usage.native) {
 			pair.sampler = point_sampler[pair.sampler];
 		}
 	}
@@ -1003,10 +1248,13 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				return false;
 			}
 			const auto& image = next.images[memory.resource];
-			if (image_opcode.needs_sampler &&
-			    image.conversion_format != Prospero::BufferFormat::kInvalid &&
-			    memory.sampler < point_sampler.size()) {
-				memory.sampler = point_sampler[memory.sampler];
+			if (image_opcode.needs_sampler && memory.sampler < point_sampler.size()) {
+				const auto usage = ImageSamplerUsage(memory.resource);
+				if (usage.point_only && usage.native) {
+					memory.point_sampler = point_sampler[memory.sampler];
+				} else if (usage.point_only) {
+					memory.sampler = point_sampler[memory.sampler];
+				}
 			}
 			if (image.indirect_root == memory.resource &&
 			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {

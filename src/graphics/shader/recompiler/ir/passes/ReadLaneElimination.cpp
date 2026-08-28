@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+
 #include <algorithm>
 
 #include <queue>
@@ -101,7 +103,8 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 
 } // namespace
 
-ReadLaneStats EliminateReadLane(ValueProgram& program, uint32_t wave_size) {
+ReadLaneStats EliminateReadLane(ValueProgram& program, uint32_t wave_size,
+                                const Program* runtime_program) {
 	ReadLaneStats stats;
 	if (wave_size != 32u && wave_size != 64u) {
 		return stats;
@@ -111,6 +114,18 @@ ReadLaneStats EliminateReadLane(ValueProgram& program, uint32_t wave_size) {
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::ReadLane) {
 				continue;
+			}
+			const auto source = inst.Arg(0).Resolve();
+			if (runtime_program != nullptr && runtime_program->values.get() == &program) {
+				std::string reason;
+				if (ValidateRuntimeValue(*runtime_program, source, reason)) {
+					// Runtime descriptor expressions are scalar and therefore identical in every
+					// guest lane. Reading any lane preserves the same value, even with a dynamic
+					// selector.
+					inst.ReplaceUsesWith(source);
+					stats.rewritten_reads++;
+					continue;
+				}
 			}
 			const auto selector = inst.Arg(1).Resolve();
 			if (!selector.IsImmediate() || selector.GetType() != Type::U32) {

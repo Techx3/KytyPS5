@@ -572,6 +572,26 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	return return_value ? result : ConstantU32(ctx.state, 0);
 }
 
+uint32_t EmitAtomicCompareSwap(ValueEmitContext& ctx, const IR::Inst& inst,
+                               const IR::MemoryInfo& mem) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto old = ctx.state.builder.AllocateId();
+			    ctx.state.builder.AddFunction(
+			        {OpAtomicCompareExchange, TypeU32(ctx.state), old,
+			         EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			         ConstantU32(ctx.state, ScopeDevice),
+			         ConstantU32(ctx.state, MemorySemanticsNone),
+			         ConstantU32(ctx.state, MemorySemanticsNone),
+			         ctx.Arg(inst, inst.NumArgs() - 3), ctx.Arg(inst, inst.NumArgs() - 2)});
+			    EmitDeviceAtomicMemoryBarrier(ctx.state);
+			    return old;
+		    });
+	});
+}
+
 uint32_t FloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                 bool max_value) {
 	struct OrderedBits {
@@ -1025,6 +1045,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
 		return true;
 	}
+	if (op == IR::ValueOpcode::BufferAtomicCompareSwap32) {
+		ctx.Define(inst, EmitAtomicCompareSwap(ctx, inst, ctx.Memory(inst)));
+		return true;
+	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {
 		ctx.Define(inst, FloatAtomic(ctx, inst, ctx.Memory(inst),
 		                             op == IR::ValueOpcode::BufferAtomicFMax32));
@@ -1052,6 +1076,30 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto source_exec = state.builder.AllocateId();
 		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
 		                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 2), target});
+		const auto source_active =
+		    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
+		ctx.Define(inst,
+		           Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0)));
+		return true;
+	}
+	if (op == IR::ValueOpcode::BpermuteU32) {
+		const auto address = Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+		                            ctx.Arg(inst, 2));
+		const auto local = Binary(
+		    state, OpBitwiseAnd, TypeU32(state),
+		    Binary(state, OpShiftRightLogical, TypeU32(state), address,
+		           ConstantU32(state, 2)),
+		    ConstantU32(state, 31));
+		const auto base = Binary(state, OpBitwiseAnd, TypeU32(state),
+		                         EmitSubgroupLocalInvocationId(state),
+		                         ConstantU32(state, 0xffffffe0u));
+		const auto target = Binary(state, OpBitwiseOr, TypeU32(state), base, local);
+		const auto shuffled = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+		                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), target});
+		const auto source_exec = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+		                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3), target});
 		const auto source_active =
 		    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 		ctx.Define(inst,

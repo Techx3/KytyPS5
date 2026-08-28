@@ -313,6 +313,19 @@ void Translator::WriteRawU32(const IR::Operand& operand, IR::U32 value) {
 	}
 }
 
+IR::F32 Translator::ApplyDx10Nan(IR::F32 value) {
+	if (!current_dx10_clamp) {
+		return value;
+	}
+	// Classify through the IEEE-754 payload instead of a floating comparison.
+	// This keeps DX10 NaN-to-+0 behavior deterministic even when the host shader
+	// compiler contracts unordered comparisons under relaxed floating-point rules.
+	const auto magnitude =
+	    ir.BitwiseAnd(ir.BitCastU32(value), IR::U32(IR::Value(0x7fffffffu)));
+	const auto nan = ir.UGreaterThan(magnitude, IR::U32(IR::Value(0x7f800000u)));
+	return SelectF32(nan, IR::F32(IR::Value::F32(0.0f)), value);
+}
+
 IR::F32 Translator::ApplyF32ResultModifiers(const IR::Operand& operand, IR::F32 value) {
 	if (operand.omod != 0u) {
 		float multiplier = 0.5f;
@@ -324,9 +337,49 @@ IR::F32 Translator::ApplyF32ResultModifiers(const IR::Operand& operand, IR::F32 
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(multiplier)}));
 	}
 	if (operand.clamp) {
+		value = ApplyDx10Nan(value);
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPSaturate32, {value}));
 	}
 	return value;
+}
+
+IR::F32 Translator::ApplyF16Overflow(IR::Opcode opcode, IR::F32 value,
+                                     const std::array<IR::F32, 3>& args,
+                                     uint32_t arg_count) {
+	if (!current_fp16_overflow) {
+		return value;
+	}
+
+	const auto magnitude_bits = [&](IR::F32 input) {
+		return ir.BitwiseAnd(ir.BitCastU32(input), IR::U32(IR::Value(0x7fffffffu)));
+	};
+	const auto is_infinity = [&](IR::F32 input) {
+		return ir.IEqual(magnitude_bits(input), IR::U32(IR::Value(0x7f800000u)));
+	};
+
+	// FP16_OVFL clamps arithmetic overflow, but infinity values produced by an
+	// infinity operand (and the architectural reciprocal/logarithm poles) remain
+	// infinity. Ordered comparison deliberately leaves every NaN untouched.
+	IR::U1 genuine_infinity(IR::Value(false));
+	for (uint32_t index = 0; index < arg_count; index++) {
+		genuine_infinity = ir.LogicalOr(genuine_infinity, is_infinity(args[index]));
+	}
+	if (arg_count != 0u &&
+	    (opcode == IR::Opcode::RcpF16 || opcode == IR::Opcode::InverseSqrtF16 ||
+	     opcode == IR::Opcode::Log2F16)) {
+		const auto zero = ir.IEqual(magnitude_bits(args[0]), IR::U32(IR::Value(0u)));
+		genuine_infinity = ir.LogicalOr(genuine_infinity, zero);
+	}
+
+	const auto magnitude = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+	const auto overflow = IR::U1(ir.Emit(
+	    IR::ValueOpcode::FPOrdGreaterThan32, {magnitude, IR::Value::F32(65504.0f)}));
+	const auto should_clamp = ir.LogicalAnd(overflow, ir.LogicalNot(genuine_infinity));
+	const auto negative = IR::U1(
+	    ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {value, IR::Value::F32(0.0f)}));
+	const auto maximum = SelectF32(negative, IR::F32(IR::Value::F32(-65504.0f)),
+	                              IR::F32(IR::Value::F32(65504.0f)));
+	return SelectF32(should_clamp, maximum, value);
 }
 
 void Translator::WriteOperand(const IR::Operand& operand, IR::Value value) {
@@ -938,7 +991,11 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 		}
 	}
 	for (size_t index = 0; index < source.blocks.size(); index++) {
-		Detail::Translator translator(result, result.blocks[index + 1u], vector_limit, wave_size);
+		const bool dx10_clamp = compute_input_info != nullptr && compute_input_info->dx10_clamp;
+		const bool fp16_overflow =
+		    compute_input_info != nullptr && compute_input_info->fp16_overflow;
+		Detail::Translator translator(result, result.blocks[index + 1u], vector_limit, wave_size,
+		                              dx10_clamp, fp16_overflow);
 		if (!translator.TranslateBlock(source.blocks[index], error) ||
 		    !translator.AddBranchCondition(source.blocks[index], result.block_info[index + 1u],
 		                                   error)) {

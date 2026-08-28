@@ -40,6 +40,7 @@ struct ImageBinding {
 	bool needs_rebind  = false;
 	bool force_general = false;
 	bool shader_write  = false;
+	bool feedback_loop = false;
 };
 
 class Image final {

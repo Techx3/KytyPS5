@@ -47,6 +47,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
+    {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
     {0x33u, Opcode::BUFFER_ATOMIC_SUB, 1, 32},
     {0x35u, Opcode::BUFFER_ATOMIC_SMIN, 1, 32},
@@ -103,7 +104,8 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
-    {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
+    {0xa1u, Opcode::DS_BPERMUTE_B32, 1, 32},     {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
+    {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
     {0xdeu, Opcode::DS_WRITE_B96, 3, 32},        {0xdfu, Opcode::DS_WRITE_B128, 4, 32},
     {0xfeu, Opcode::DS_READ_B96, 3, 32},         {0xffu, Opcode::DS_READ_B128, 4, 32},
@@ -192,6 +194,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B64:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32: return 3u;
+		case Opcode::DS_BPERMUTE_B32: return 2u;
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
 		case Opcode::DS_APPEND: return 0u;
@@ -400,9 +403,11 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		}
 	}
 	if (inst.gds &&
-	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
+	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_BPERMUTE_B32 ||
+	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
-		SetUnsupported(inst, Family::DS, opcode, "DS swizzle/addtid is available only for LDS");
+		SetUnsupported(inst, Family::DS, opcode,
+		               "DS swizzle/permute/addtid is available only for LDS");
 	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,
@@ -429,10 +434,11 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
-	if (inst.opcode == Opcode::DS_READ_U16_D16) {
+	if (inst.opcode == Opcode::DS_READ_U16_D16 ||
+	    inst.opcode == Opcode::DS_READ_U16_D16_HI) {
 		// Native D16 reads update only the selected destination half. Reuse the partial
-		// destination representation so the typed lowering preserves the upper word.
-		inst.dst.sdwa_sel = 4u;
+		// destination representation so the typed lowering preserves the other word.
+		inst.dst.sdwa_sel = (inst.opcode == Opcode::DS_READ_U16_D16 ? 4u : 5u);
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	DecodeVectorGpr(data0, inst.src1);

@@ -16,22 +16,29 @@ bool Translator::TranslatePackedFloat16(const IR::Instruction& inst) {
 		default: return false;
 	}
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src[0], high, true);
-		const auto rhs = ReadF16LaneAsF32(inst.src[1], high, true);
+		std::array<IR::F32, 3> args;
+		args[0] = ReadF16LaneAsF32(inst.src[0], high, true);
+		args[1] = ReadF16LaneAsF32(inst.src[1], high, true);
+		if (inst.op == IR::Opcode::PackedMinF16 || inst.op == IR::Opcode::PackedMaxF16) {
+			args[0] = ApplyDx10Nan(args[0]);
+			args[1] = ApplyDx10Nan(args[1]);
+		}
 		IR::F32    result;
 		if (inst.src_count == 3u) {
-			result = IR::F32(
-			    ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src[2], high, true)}));
+			args[2] = ReadF16LaneAsF32(inst.src[2], high, true);
+			result  = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]}));
 		} else {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
+			result = IR::F32(ir.Emit(opcode, {args[0], args[1]}));
 		}
-		return ApplyF32ResultModifiers(inst.dst, result);
+		result = ApplyF32ResultModifiers(inst.dst, result);
+		return ApplyF16Overflow(inst.op, result, args, inst.src_count);
 	};
 	auto raw    = inst.dst;
 	raw.omod    = 0u;
 	raw.clamp   = false;
 	auto result = PackHalf2x16(translate_lane(false), translate_lane(true));
-	if (inst.op == IR::Opcode::PackedMinF16 || inst.op == IR::Opcode::PackedMaxF16) {
+	if (!current_dx10_clamp &&
+	    (inst.op == IR::Opcode::PackedMinF16 || inst.op == IR::Opcode::PackedMaxF16)) {
 		const auto quiet_snan = [&](const IR::Operand& operand, bool high) {
 			const auto bits     = ReadU16LaneAsU32(operand, high, false);
 			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7c00u)));
@@ -77,10 +84,17 @@ bool Translator::TranslateFloat16Operation(const IR::Instruction& inst) {
 		case IR::Opcode::Med3F16: opcode = IR::ValueOpcode::FPMedTri32; break;
 		default: return false;
 	}
-	std::array<IR::Value, 3> args;
+	std::array<IR::F32, 3> args;
 	for (uint32_t index = 0; index < inst.src_count; index++) {
-		args[index] = inst.op == IR::Opcode::MadMixF16 ? IR::Value(ReadMixF32(inst.src[index]))
-		                                               : IR::Value(ReadF16AsF32(inst.src[index]));
+		args[index] = inst.op == IR::Opcode::MadMixF16 ? ReadMixF32(inst.src[index])
+		                                               : ReadF16AsF32(inst.src[index]);
+	}
+	if (inst.op == IR::Opcode::MinF16 || inst.op == IR::Opcode::MaxF16 ||
+	    inst.op == IR::Opcode::Min3F16 || inst.op == IR::Opcode::Max3F16 ||
+	    inst.op == IR::Opcode::Med3F16) {
+		for (uint32_t index = 0; index < inst.src_count; index++) {
+			args[index] = ApplyDx10Nan(args[index]);
+		}
 	}
 	IR::F32 result;
 	switch (inst.src_count) {
@@ -89,17 +103,21 @@ bool Translator::TranslateFloat16Operation(const IR::Instruction& inst) {
 		case 3: result = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})); break;
 		default: EXIT("invalid half-float source count: %u", inst.src_count);
 	}
+	result = ApplyF32ResultModifiers(inst.dst, result);
+	result = ApplyF16Overflow(inst.op, result, args, inst.src_count);
 	if (inst.op == IR::Opcode::SqrtF16 || inst.op == IR::Opcode::InverseSqrtF16 ||
 	    inst.op == IR::Opcode::Log2F16) {
 		const auto negative = IR::U1(
 		    ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {args[0], IR::Value::F32(0.0f)}));
-		result = ApplyF32ResultModifiers(inst.dst, result);
 		const auto bits = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 		const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 		WriteU16(inst.dst, ir.Select(negative, invalid, bits));
 		return true;
 	}
-	WriteF16(inst.dst, result);
+	auto raw  = inst.dst;
+	raw.omod  = 0u;
+	raw.clamp = false;
+	WriteF16(raw, result);
 	return true;
 }
 
@@ -153,6 +171,10 @@ bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
 	}
 	if (opcode != IR::ValueOpcode {}) {
 		std::array<IR::Value, 3> args;
+		const bool dx10_min_max =
+		    inst.op == IR::Opcode::FMinF32 || inst.op == IR::Opcode::FMaxF32 ||
+		    inst.op == IR::Opcode::FMin3F32 || inst.op == IR::Opcode::FMax3F32 ||
+		    inst.op == IR::Opcode::FMed3F32;
 		for (uint32_t index = 0; index < inst.src_count; index++) {
 			const auto arg_type = IR::ArgTypeOf(opcode, index);
 			args[index] =
@@ -160,6 +182,9 @@ bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
 			        ? (inst.op == IR::Opcode::FMadF32 ? IR::Value(ReadMixF32(inst.src[index]))
 			                                          : ReadOperand(inst.src[index], IR::Type::F32))
 			        : ReadOperand(inst.src[index], arg_type);
+			if (dx10_min_max && arg_type == IR::Type::F32) {
+				args[index] = ApplyDx10Nan(IR::F32(args[index]));
+			}
 		}
 		IR::Value result;
 		switch (inst.src_count) {

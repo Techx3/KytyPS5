@@ -699,7 +699,9 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("s2-NPIvz+iA", Http::HttpSetNonblock);
 	LIB_FUNC("htyBOoWeS58", Http::HttpsSetSslCallback);
 	LIB_FUNC("jUjp+yqMNdQ", Http::HttpsSetMinSslVersion);
+	LIB_FUNC("f42K37mm5RM", Http::HttpsEnableOption);
 	LIB_FUNC("mSQCxzWTwVI", Http::HttpsDisableOption);
+	LIB_FUNC("PDxS48xGQLs", Http::HttpSetChunkedTransferEnabled);
 	LIB_FUNC("6381dWF+xsQ", Http::HttpCreateEpoll);
 	LIB_FUNC("wYhXVfS2Et4", Http::HttpDestroyEpoll);
 	LIB_FUNC("-xm7kZQNpHI", Http::HttpSetEpoll);

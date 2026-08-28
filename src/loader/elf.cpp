@@ -1,4 +1,5 @@
 #include "loader/elf.h"
+#include "loader/elfValidator.h"
 
 #include "common/assert.h"
 #include "common/file.h"
@@ -531,6 +532,13 @@ bool Elf64::IsValid() const {
 
 void Elf64::Open(const std::filesystem::path& file_name) {
 	Clear();
+
+	ElfValidationReport validation;
+	std::string         validation_error;
+	if (!ValidateElfFile(file_name, &validation, &validation_error)) {
+		EXIT("Invalid ELF/SELF %s: %s\n", Common::PathToString(file_name).c_str(),
+		     validation_error.c_str());
+	}
 
 	m_f = std::make_unique<Common::File>();
 	m_f->Open(file_name, Common::File::Mode::Read);

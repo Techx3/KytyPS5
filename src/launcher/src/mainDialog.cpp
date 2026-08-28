@@ -210,7 +210,15 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--present-mode" << EnumToText(info.present_mode);
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
+	args << "--local-players" << QString::number(info.local_player_count);
+	for (int player = 0; player < Configuration::MAX_LOCAL_PLAYERS; player++) {
+		const auto guid = info.controller_guids.value(player).trimmed();
+		if (!guid.isEmpty()) {
+			args << "--controller-guid" << QStringLiteral("%1=%2").arg(player + 1).arg(guid);
+		}
+	}
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
+	args << "--vulkan-debug-markers" << BoolArg(info.vulkan_debug_markers_enabled);
 	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);

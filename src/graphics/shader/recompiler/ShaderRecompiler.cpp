@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
+#include "graphics/shader/recompiler/ir/passes/Wave64MaterialBatch.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -588,6 +589,121 @@ uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputIn
 
 } // namespace
 
+bool TryLinkSplitGeometryPrograms(std::span<const uint32_t> front,
+                                  std::span<const uint32_t> back,
+                                  std::vector<uint32_t>& linked, std::string* error) {
+	linked.clear();
+	if (front.empty() || back.empty()) {
+		if (error != nullptr) {
+			*error = "split geometry shader has an empty half";
+		}
+		return false;
+	}
+
+	Decoder::Program front_program;
+	Decoder::Program back_program;
+	if (!Decoder::DecodeProgram(front, front_program, error) ||
+	    !Decoder::DecodeProgram(back, back_program, error)) {
+		return false;
+	}
+	if (front_program.instructions.empty() || back_program.instructions.empty()) {
+		if (error != nullptr) {
+			*error = "split geometry shader decoded to an empty half";
+		}
+		return false;
+	}
+
+	const auto& continuation = front_program.instructions.back();
+	if (continuation.opcode != Decoder::Opcode::S_SETPC_B64 ||
+	    continuation.src0.kind != Decoder::OperandKind::Sgpr || continuation.src0.reg != 6u ||
+	    continuation.word_count != 1u) {
+		if (error != nullptr) {
+			*error = "GsFront does not end in the canonical s[6:7] continuation";
+		}
+		return false;
+	}
+
+	const auto is_lds_write = [](const Decoder::Instruction& inst) {
+		if (inst.gds) {
+			return false;
+		}
+		switch (inst.opcode) {
+			case Decoder::Opcode::DS_WRITE_B8:
+			case Decoder::Opcode::DS_WRITE_B16:
+			case Decoder::Opcode::DS_WRITE_B32:
+			case Decoder::Opcode::DS_WRITE_B64:
+			case Decoder::Opcode::DS_WRITE_B96:
+			case Decoder::Opcode::DS_WRITE_B128:
+			case Decoder::Opcode::DS_WRITE2_B32:
+			case Decoder::Opcode::DS_WRITE2ST64_B32:
+			case Decoder::Opcode::DS_WRITE2_B64:
+			case Decoder::Opcode::DS_WRITE2ST64_B64:
+			case Decoder::Opcode::DS_WRITE_ADDTID_B32: return true;
+			default: return false;
+		}
+	};
+	const auto is_lds_read = [](const Decoder::Instruction& inst) {
+		if (inst.gds) {
+			return false;
+		}
+		switch (inst.opcode) {
+			case Decoder::Opcode::DS_READ_I8:
+			case Decoder::Opcode::DS_READ_U8:
+			case Decoder::Opcode::DS_READ_I16:
+			case Decoder::Opcode::DS_READ_U16:
+			case Decoder::Opcode::DS_READ_U16_D16:
+			case Decoder::Opcode::DS_READ_U16_D16_HI:
+			case Decoder::Opcode::DS_READ_B32:
+			case Decoder::Opcode::DS_READ_B64:
+			case Decoder::Opcode::DS_READ_B96:
+			case Decoder::Opcode::DS_READ_B128:
+			case Decoder::Opcode::DS_READ2_B32:
+			case Decoder::Opcode::DS_READ2ST64_B32:
+			case Decoder::Opcode::DS_READ2_B64:
+			case Decoder::Opcode::DS_READ2ST64_B64:
+			case Decoder::Opcode::DS_READ_ADDTID_B32: return true;
+			default: return false;
+		}
+	};
+
+	const bool front_writes_lds =
+	    std::ranges::any_of(front_program.instructions, is_lds_write);
+	const bool back_reads_lds = std::ranges::any_of(back_program.instructions, is_lds_read);
+	const bool back_exports_position =
+	    std::ranges::any_of(back_program.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::EXP && inst.exp.target == 0x0cu &&
+		           inst.exp.en != 0u;
+	    });
+	const bool back_has_pc_relative_data =
+	    std::ranges::any_of(back_program.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+		           inst.opcode == Decoder::Opcode::S_SETPC_B64;
+	    });
+	if (!front_writes_lds || !back_reads_lds || !back_exports_position ||
+	    back_has_pc_relative_data) {
+		if (error != nullptr) {
+			*error = fmt::format(
+			    "split geometry shader is not a relocatable LDS hand-off: write={} read={} "
+			    "position={} pc_relative={}",
+			    front_writes_lds, back_reads_lds, back_exports_position,
+			    back_has_pc_relative_data);
+		}
+		return false;
+	}
+
+	const auto continuation_word = continuation.pc / sizeof(uint32_t);
+	if (continuation_word >= front.size()) {
+		if (error != nullptr) {
+			*error = "GsFront continuation lies outside its mapped code";
+		}
+		return false;
+	}
+	linked.reserve(continuation_word + back.size());
+	linked.insert(linked.end(), front.begin(), front.begin() + continuation_word);
+	linked.insert(linked.end(), back.begin(), back.end());
+	return true;
+}
+
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
                   CompileResult& result, std::string* error) {
 	if (code.empty()) {
@@ -635,7 +751,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	CFG::Graph cfg;
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	if (!CFG::BuildGraph(decoded, cfg, error)) {
+	if (!CFG::BuildGraph(decoded, cfg, error, options.terminal_external_setpc_sgpr)) {
 		return false;
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
@@ -733,12 +849,21 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	IR::ResolveControlFlowIdentities(*ir.values);
 	IR::RemoveIdentities(ir.values->blocks);
 	IR::EliminateDeadCode(ir.values->blocks);
-	const auto read_lane_stats = IR::EliminateReadLane(*ir.values, ir.wave_size);
+	const auto read_lane_stats = IR::EliminateReadLane(*ir.values, ir.wave_size, &ir);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
 		IR::ConstantPropagationPass(ir.values->blocks);
 		IR::ResolveControlFlowIdentities(*ir.values);
+		IR::RemoveIdentities(ir.values->blocks);
+		IR::EliminateDeadCode(ir.values->blocks);
+	}
+	const auto material_batch_stats = IR::SplitWave64MaterialBatches(
+	    *ir.values, ir.wave_size, options.host_subgroup_size);
+	if (material_batch_stats.rewritten_masks != 0) {
+		LOGF("%s split Wave64 material batches: masks=%" PRIu32 " host_subgroup=%" PRIu32 "\n",
+		     GetDumpLabel(options), material_batch_stats.rewritten_masks,
+		     options.host_subgroup_size);
 		IR::RemoveIdentities(ir.values->blocks);
 		IR::EliminateDeadCode(ir.values->blocks);
 	}
@@ -760,6 +885,10 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 	IR::EliminateDeadCode(ir.values->blocks);
 	if (!IR::TrackResources(ir, error)) {
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.ir_dump      = MakeIrDump(cfg, ir);
+		}
 		return false;
 	}
 	IR::EliminateDeadCode(ir.values->blocks);

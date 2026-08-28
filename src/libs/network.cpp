@@ -122,7 +122,9 @@ public:
 	bool HttpSetNonblock(Id id, bool enable);
 	bool HttpsSetSslCallback(Id id, HttpsCallback cbfunc, void* user_arg);
 	bool HttpsSetMinSslVersion(Id id, uint32_t ssl_version);
+	bool HttpsEnableOption(Id id, uint32_t ssl_flags);
 	bool HttpsDisableOption(Id id, uint32_t ssl_flags);
+	bool HttpSetChunkedTransferEnabled(Id id, bool enable);
 	bool HttpAddRequestHeader(Id id, const char* name, const char* value, bool add);
 	bool HttpValid(Id http_ctx_id);
 	bool HttpValidTemplate(Id tmpl_id);
@@ -181,6 +183,7 @@ private:
 		std::vector<HttpHeader> headers;
 		bool                    used            = false;
 		bool                    nonblock        = false;
+		bool                    chunked_transfer = false;
 		bool                    auto_redirect   = true;
 		bool                    auth_enabled    = true;
 		HttpsCallback           ssl_cbfunc      = nullptr;
@@ -708,6 +711,32 @@ bool Network::HttpsDisableOption(Id id, uint32_t ssl_flags) {
 
 	if (base != nullptr) {
 		base->ssl_flags &= ~ssl_flags;
+		return true;
+	}
+
+	return false;
+}
+
+bool Network::HttpsEnableOption(Id id, uint32_t ssl_flags) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+
+	if (base != nullptr) {
+		base->ssl_flags |= ssl_flags;
+		return true;
+	}
+
+	return false;
+}
+
+bool Network::HttpSetChunkedTransferEnabled(Id id, bool enable) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+
+	if (base != nullptr) {
+		base->chunked_transfer = enable;
 		return true;
 	}
 
@@ -2545,6 +2574,34 @@ int KYTY_SYSV_ABI HttpsDisableOption(int id, uint32_t ssl_flags) {
 	     id, ssl_flags);
 
 	if (!g_net->HttpsDisableOption(Network::Id(id), ssl_flags)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsEnableOption(int id, uint32_t ssl_flags) {
+	PRINT_NAME();
+
+	LOGF("\t id        = %d\n"
+	     "\t ssl_flags = %u\n",
+	     id, ssl_flags);
+
+	if (!g_net->HttpsEnableOption(Network::Id(id), ssl_flags)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int enable) {
+	PRINT_NAME();
+
+	LOGF("\t id     = %d\n"
+	     "\t enable = %d\n",
+	     id, enable);
+
+	if (!g_net->HttpSetChunkedTransferEnabled(Network::Id(id), enable != 0)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 

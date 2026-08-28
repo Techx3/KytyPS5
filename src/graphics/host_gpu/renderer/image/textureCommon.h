@@ -43,11 +43,17 @@ struct TextureUploadLayout {
 	TextureUploadMipLayout mips[16] = {};
 };
 
-vk::ComponentMapping   TextureGetComponentMapping(uint32_t swizzle);
-SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
+vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle);
+SurfaceFormatInfo    TextureGetSurfaceFormatInfo(Prospero::BufferFormat format,
+                                                 bool sampled = false);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);
+[[nodiscard]] inline constexpr uint32_t
+TextureGetRenderTargetWriteMask(Prospero::ColorComponentMapping mapping, uint32_t target_mask,
+                                uint32_t shader_mask) noexcept {
+	return mapping.ApplyMask((target_mask & shader_mask) & 0x0fu);
+}
 TextureUploadLayout    TextureCalcUploadLayout(Prospero::BufferFormat format, uint32_t width,
                                                uint32_t height, uint32_t levels, uint32_t depth,
                                                Prospero::TileMode tile, uint64_t upload_size,

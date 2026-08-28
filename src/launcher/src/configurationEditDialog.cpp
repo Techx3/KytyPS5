@@ -12,10 +12,13 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
+#include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QRegularExpressionValidator>
 #include <QSettings>
 #include <QSpinBox>
 #include <QStyle>
@@ -96,6 +99,11 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
       m_info(info) {
 	m_ui->setupUi(this);
 	InitGameDirectories();
+	for (auto* field: {m_ui->lineEdit_controller_guid_1, m_ui->lineEdit_controller_guid_2,
+	                   m_ui->lineEdit_controller_guid_3, m_ui->lineEdit_controller_guid_4}) {
+		field->setValidator(
+		    new QRegularExpressionValidator(QRegularExpression("[0-9A-Fa-f]{0,32}"), field));
+	}
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
@@ -111,6 +119,13 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
 		        m_ui->lineEdit_printf_file->setEnabled(log == Configuration::LogDirection::File);
+	        });
+	connect(m_ui->spinBox_local_players,
+	        static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged), this, [this](int count) {
+		        m_ui->lineEdit_controller_guid_1->setEnabled(count >= 1);
+		        m_ui->lineEdit_controller_guid_2->setEnabled(count >= 2);
+		        m_ui->lineEdit_controller_guid_3->setEnabled(count >= 3);
+		        m_ui->lineEdit_controller_guid_4->setEnabled(count >= 4);
 	        });
 
 	layout()->setSizeConstraint(QLayout::SetFixedSize);
@@ -157,6 +172,15 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_gpu_performance_metrics->setChecked(info.gpu_performance_metrics_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
+	m_ui->spinBox_local_players->setValue(info.local_player_count);
+	m_ui->lineEdit_controller_guid_1->setText(info.controller_guids.value(0));
+	m_ui->lineEdit_controller_guid_2->setText(info.controller_guids.value(1));
+	m_ui->lineEdit_controller_guid_3->setText(info.controller_guids.value(2));
+	m_ui->lineEdit_controller_guid_4->setText(info.controller_guids.value(3));
+	m_ui->lineEdit_controller_guid_1->setEnabled(info.local_player_count >= 1);
+	m_ui->lineEdit_controller_guid_2->setEnabled(info.local_player_count >= 2);
+	m_ui->lineEdit_controller_guid_3->setEnabled(info.local_player_count >= 3);
+	m_ui->lineEdit_controller_guid_4->setEnabled(info.local_player_count >= 4);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
 	m_ui->comboBox_console_language->setCurrentIndex(
@@ -165,6 +189,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	        : Configuration::DEFAULT_CONSOLE_LANGUAGE);
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
+	m_ui->checkBox_vulkan_debug_markers->setChecked(info.vulkan_debug_markers_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 #if defined(_WIN32)
 	m_ui->checkBox_red_zone_protection->setChecked(info.red_zone_protection_enabled);
@@ -293,9 +318,15 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.gpu_performance_metrics_enabled = ui.checkBox_gpu_performance_metrics->isChecked();
 	info.vblank_frequency                = ui.spinBox_vblank_frequency->value();
 	info.console_language                = ui.comboBox_console_language->currentIndex();
-	info.vulkan_validation_enabled       = ui.checkBox_vulkan_validation->isChecked();
-	info.shader_validation_enabled       = ui.checkBox_shader_validation->isChecked();
-	info.renderdoc_enabled               = ui.checkBox_renderdoc_capture->isChecked();
+	info.local_player_count              = ui.spinBox_local_players->value();
+	info.controller_guids             = {ui.lineEdit_controller_guid_1->text().trimmed().toLower(),
+	                                     ui.lineEdit_controller_guid_2->text().trimmed().toLower(),
+	                                     ui.lineEdit_controller_guid_3->text().trimmed().toLower(),
+	                                     ui.lineEdit_controller_guid_4->text().trimmed().toLower()};
+	info.vulkan_validation_enabled    = ui.checkBox_vulkan_validation->isChecked();
+	info.vulkan_debug_markers_enabled = ui.checkBox_vulkan_debug_markers->isChecked();
+	info.shader_validation_enabled    = ui.checkBox_shader_validation->isChecked();
+	info.renderdoc_enabled            = ui.checkBox_renderdoc_capture->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
@@ -325,6 +356,15 @@ void ConfigurationEditDialog::save() {
 	if (MandatoryLineEdit::FindEmpty(this)) {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
 		return;
+	}
+	for (auto* field: {m_ui->lineEdit_controller_guid_1, m_ui->lineEdit_controller_guid_2,
+	                   m_ui->lineEdit_controller_guid_3, m_ui->lineEdit_controller_guid_4}) {
+		if (!field->text().isEmpty() && field->text().size() != 32) {
+			QMessageBox::critical(
+			    this, tr("Save failed"),
+			    tr("Controller GUIDs must contain exactly 32 hexadecimal digits"));
+			return;
+		}
 	}
 
 	update_info();

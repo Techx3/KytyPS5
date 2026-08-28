@@ -878,11 +878,37 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(g_virtual_ranges == nullptr);
+bool TryReadGpuSynchronizedBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (TryReadGpuCleanBacking(vaddr, data, size)) {
+		return true;
+	}
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
-	if (clamped_size == 0) {
+	auto& resources = GetGpuResources();
+	if (resources.GetTextureCache().QueryRegion(vaddr, size).gpu_image_bytes) {
+		return false;
+	}
+	auto& buffers = resources.GetBufferCache();
+	if (!buffers.HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	// Shader specialization may follow a guest S_BUFFER_LOAD through a table written by an
+	// earlier GPU command. Publish that exact range before evaluating the descriptor on the host.
+	buffers.ReadMemory(vaddr, size);
+	return TryReadGpuCleanBacking(vaddr, data, size);
+}
+
+bool TryClampRangeSize(uint64_t vaddr, uint64_t size, uint64_t& clamped_size) {
+	clamped_size = g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
+	return clamped_size != 0;
+}
+
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	uint64_t clamped_size = 0;
+	if (!TryClampRangeSize(vaddr, size, clamped_size)) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
 		     vaddr, size);
@@ -950,16 +976,20 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	return false;
 }
 
-bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
+bool IsPrtBackingRange(uint64_t vaddr, uint64_t size) {
 	std::vector<VirtualRanges::Range> ranges;
 	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
 	    !IsInPrtAperture(vaddr, size) || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
 		return false;
 	}
-	if (std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {
-		    return !IsReservedRangeType(range.type) &&
-		           !g_guest_address_space->BackingContains(range.start, range.size);
-	    })) {
+	return std::none_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		return !IsReservedRangeType(range.type) &&
+		       !g_guest_address_space->BackingContains(range.start, range.size);
+	});
+}
+
+bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (!IsPrtBackingRange(vaddr, size)) {
 		return false;
 	}
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);

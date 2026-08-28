@@ -50,6 +50,7 @@ class Configuration: public QObject {
 public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
+	static constexpr int MAX_LOCAL_PLAYERS        = 4;
 
 	enum class Resolution {
 		R1280X720,
@@ -94,6 +95,7 @@ public:
 	int                    vblank_frequency                = 60;
 	int                    console_language                = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled       = false;
+	bool                   vulkan_debug_markers_enabled    = false;
 	bool                   shader_validation_enabled       = true;
 	ShaderOptimizationType shader_optimization_type        = ShaderOptimizationType::Performance;
 	ShaderLogDirection     shader_log_direction            = ShaderLogDirection::Silent;
@@ -105,6 +107,8 @@ public:
 	QString                printf_output_file              = "_kyty.txt";
 	ProfilerDirection      profiler_direction              = ProfilerDirection::None;
 	bool                   renderdoc_enabled               = false;
+	int                    local_player_count              = MAX_LOCAL_PLAYERS;
+	QStringList            controller_guids;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -119,6 +123,7 @@ public:
 		vblank_frequency                = other.vblank_frequency;
 		console_language                = other.console_language;
 		vulkan_validation_enabled       = other.vulkan_validation_enabled;
+		vulkan_debug_markers_enabled    = other.vulkan_debug_markers_enabled;
 		shader_validation_enabled       = other.shader_validation_enabled;
 		shader_optimization_type        = other.shader_optimization_type;
 		shader_log_direction            = other.shader_log_direction;
@@ -130,6 +135,8 @@ public:
 		printf_output_file              = other.printf_output_file;
 		profiler_direction              = other.profiler_direction;
 		renderdoc_enabled               = other.renderdoc_enabled;
+		local_player_count              = other.local_player_count;
+		controller_guids                = other.controller_guids;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -161,6 +168,7 @@ public:
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
+		KYTY_CFG_SET(vulkan_debug_markers_enabled);
 		KYTY_CFG_SET(shader_validation_enabled);
 		KYTY_CFG_SET(shader_optimization_type);
 		KYTY_CFG_SET(shader_log_direction);
@@ -172,6 +180,8 @@ public:
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_direction);
 		KYTY_CFG_SET(renderdoc_enabled);
+		KYTY_CFG_SET(local_player_count);
+		s->setValue("controller_guids", controller_guids);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -193,6 +203,7 @@ public:
 			console_language = DEFAULT_CONSOLE_LANGUAGE;
 		}
 		KYTY_CFG_GET(vulkan_validation_enabled);
+		KYTY_CFG_GET(vulkan_debug_markers_enabled);
 		KYTY_CFG_GET(shader_validation_enabled);
 		KYTY_CFG_GET(shader_optimization_type);
 		KYTY_CFG_GET(shader_log_direction);
@@ -205,6 +216,11 @@ public:
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_direction);
 		KYTY_CFG_GET(renderdoc_enabled);
+		local_player_count = s->value("local_player_count", local_player_count).toInt();
+		if (local_player_count < 1 || local_player_count > MAX_LOCAL_PLAYERS) {
+			local_player_count = MAX_LOCAL_PLAYERS;
+		}
+		controller_guids = s->value("controller_guids", controller_guids).toStringList();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

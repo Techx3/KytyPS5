@@ -136,6 +136,8 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	[[nodiscard]] ImageId       ReinterpretBacking(const ImageInfo& requested, BindingType binding,
+	                                               ImageId source);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id, const ImageDesc& desc);
@@ -146,7 +148,7 @@ private:
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
-	void CommitGpuWrite(Image& image);
+	void CommitGpuWrite(ImageId id, Image& image);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);

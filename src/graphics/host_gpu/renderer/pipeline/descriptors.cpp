@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -555,7 +556,8 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage || (Prospero::IsSampledTextureFormat(format) &&
+	    raw_sint_storage || (format != Prospero::BufferFormat::k16SInt &&
+	                         Prospero::IsSampledTextureFormat(format) &&
 	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
 	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
@@ -617,6 +619,51 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	return desc;
 }
 
+static bool CanResolveIndirectTextureLayout(const ShaderRecompiler::IR::ImageResource& resource,
+                                            const ShaderTextureResource&               descriptor) {
+	if (resource.indirect_root == ShaderRecompiler::IR::ImageResource::NoIndirectImage) {
+		return true;
+	}
+	const auto               type         = TextureType(descriptor);
+	const bool               multisampled = IsMultisampledTexture(type);
+	const bool               volume       = type == Prospero::ImageType::kColor3D;
+	const auto               format       = descriptor.Format();
+	const auto               tile         = descriptor.TileMode();
+	TileTextureElementLayout element {};
+	if (!TileGetTextureElementLayout(format, element)) {
+		return false;
+	}
+	if (multisampled) {
+		return tile == Prospero::TileMode::kDepth || tile == Prospero::TileMode::kRenderTarget;
+	}
+	if (tile != Prospero::TileMode::kLinear) {
+		TileTextureBlockLayout block {};
+		if (!TileGetTextureBlockLayout(format, tile, volume, block)) {
+			return false;
+		}
+	}
+	const auto width             = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+	const auto height            = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	const auto depth             = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	const auto maximum_dimension = std::max(
+	    width, type == Prospero::ImageType::kColor1D || type == Prospero::ImageType::kColor1DArray
+	               ? 1u
+	               : std::max(height, volume ? depth : 1u));
+	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
+	if (max_mip >= std::bit_width(maximum_dimension)) {
+		return false;
+	}
+	if (multisampled) {
+		return descriptor.BaseLevel() == 0u && descriptor.LastLevel() >= 1u &&
+		       descriptor.LastLevel() <= 3u && max_mip == descriptor.LastLevel();
+	}
+	const bool dynamic_storage =
+	    resource.written && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	const auto view_last_level =
+	    dynamic_storage ? descriptor.LastLevel() : std::min(descriptor.LastLevel(), max_mip);
+	return descriptor.BaseLevel() <= view_last_level && view_last_level <= max_mip;
+}
+
 static void PopulateTextureMipLayout(ImageInfo& info) {
 	if (info.IsVolume() && info.tile_mode != Prospero::TileMode::kLinear) {
 		TileSurfaceLayout            surface {};
@@ -662,6 +709,21 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	}
 }
 
+static void ValidateTextureBaseLayer(const ShaderRecompiler::IR::ImageResource& resource,
+                                     const ShaderTextureResource& descriptor,
+                                     uint32_t image_layers) {
+	if (descriptor.BaseArray5() < image_layers) {
+		return;
+	}
+	EXIT("texture base layer is out of bounds: dimension=%u descriptor_type=%u "
+	     "base_array=%u depth=%u image_layers=%u addr=0x%016" PRIx64
+	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(descriptor.Type()),
+	     descriptor.BaseArray5(), descriptor.Depth(), image_layers, descriptor.Base40(),
+	     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+	     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      bool shader_conversion, bool storage, uint32_t view_levels,
@@ -679,17 +741,13 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
 			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
-			}
+			ValidateTextureBaseLayer(resource, descriptor, image_layers);
 			view.layer_count = 1;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
 			view.type       = vk::ImageViewType::e1DArray;
 			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
-			}
+			ValidateTextureBaseLayer(resource, descriptor, image_layers);
 			view.layer_count = image_layers - view.base_layer;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
@@ -701,18 +759,14 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
-			}
+			ValidateTextureBaseLayer(resource, descriptor, image_layers);
 			view.layer_count = image_layers - view.base_layer;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
-			}
+			ValidateTextureBaseLayer(resource, descriptor, image_layers);
 			view.layer_count = 1;
 			break;
 		default: EXIT("unsupported texture view dimension\n");
@@ -730,11 +784,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
+	const auto ResolveNull = [&](TextureFallbackReason fallback) {
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return TextureBinding {id, nullptr, std::move(desc), vk::ImageLayout::eUndefined, {},
+		                       fallback};
+	};
+	if (descriptor.IsNull()) {
+		return ResolveNull(TextureFallbackReason::NullDescriptor);
+	}
+	if (!CanResolveIndirectTextureLayout(resource, descriptor)) {
+		return ResolveNull(TextureFallbackReason::InvalidIndirectLayout);
 	}
 
 	const auto address      = descriptor.Base40();
@@ -775,13 +836,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    multisampled ? 1u : static_cast<uint32_t>(view_last_level - base_level) + 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = descriptor.Format();
-	const auto surface_format = TextureGetSurfaceFormatInfo(format);
+	const auto surface_format = TextureGetSurfaceFormatInfo(format, !storage);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
+	const bool sampled_uint_class =
+	    Prospero::IsUintTextureFormat(format) || Prospero::IsSampledSintTextureFormat(format);
 	const bool sampled_numeric_class =
 	    storage || (Prospero::IsSampledTextureFormat(format) &&
 	                (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
-	                    Prospero::IsUintTextureFormat(format));
+	                    sampled_uint_class);
 	if (!storage &&
 	    (resource.kind == ShaderRecompiler::IR::ResourceKind::Image ||
 	     resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) &&
@@ -813,6 +876,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+
+	if (resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage) {
+		uint64_t   mapped_size = 0;
+		const bool densely_backed =
+		    Libs::LibKernel::Memory::TryClampRangeSize(address, size.size, mapped_size) &&
+		    mapped_size == size.size;
+		if (!densely_backed &&
+		    !Libs::LibKernel::Memory::IsPrtBackingRange(address, size.size)) {
+			return ResolveNull(TextureFallbackReason::UnbackedIndirectRange);
+		}
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
@@ -843,7 +917,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		PopulateTextureMipLayout(desc.info);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
-	                                 view_levels, desc.info.resources.layers);
+	                                 view_levels, image_layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
@@ -866,6 +940,48 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};
+}
+
+std::string DescribeImageBindings(const PreparedBindings& prepared,
+                                  TextureCache&           texture_cache) {
+	if (prepared.program == nullptr || prepared.snapshot == nullptr ||
+	    prepared.resources.images.size() != prepared.program->info.images.size() ||
+	    prepared.snapshot->images.size() != prepared.program->info.images.size()) {
+		return "invalid";
+	}
+
+	const auto FallbackName = [](TextureFallbackReason fallback) {
+		switch (fallback) {
+			case TextureFallbackReason::None: return "none";
+			case TextureFallbackReason::NullDescriptor: return "null";
+			case TextureFallbackReason::InvalidIndirectLayout: return "layout";
+			case TextureFallbackReason::UnbackedIndirectRange: return "unbacked";
+		}
+		return "unknown";
+	};
+
+	std::string result = fmt::format("{}[", prepared.program->info.images.size());
+	for (uint32_t i = 0; i < prepared.program->info.images.size(); i++) {
+		const auto& resource = prepared.program->info.images[i];
+		const auto& binding  = prepared.resources.images[i];
+		const auto  raw = DecodeNativeDescriptor<ShaderTextureResource>(prepared.snapshot->images[i]);
+		const auto& image = texture_cache.GetImage(binding.image_id);
+		if (i != 0) {
+			result.push_back(';');
+		}
+		fmt::format_to(std::back_inserter(result),
+		               "{}:0x{:010x}/g{}/t{}/ty{}/ir{}->", i, raw.Base40(),
+		               static_cast<uint32_t>(raw.Format()), static_cast<uint32_t>(raw.TileMode()),
+		               static_cast<uint32_t>(raw.Type()), resource.indirect_root);
+		fmt::format_to(std::back_inserter(result), "0x{:010x}/g{}/v{}/s0x{:x}",
+		               image.info.data.address, static_cast<uint32_t>(image.info.guest_format),
+		               static_cast<uint32_t>(image.info.pixel_format), image.info.data.size);
+		if (binding.fallback != TextureFallbackReason::None) {
+			fmt::format_to(std::back_inserter(result), "/fb={}", FallbackName(binding.fallback));
+		}
+	}
+	result.push_back(']');
+	return result;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -1078,7 +1194,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
+		    old_image->depth_id || old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
@@ -1209,6 +1325,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				            : vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead};
 				AppendBarriers(image.GetBarriers(vk::ImageLayout::eGeneral, access,
 				                                 Image::DestinationStages(access), range));
+			} else if (image.binding.feedback_loop) {
+				auto access = vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead};
+				if (image.info.IsDepth()) {
+					access |= vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+					          vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+				} else {
+					access |= vk::AccessFlagBits2::eColorAttachmentRead |
+					          vk::AccessFlagBits2::eColorAttachmentWrite;
+				}
+				AppendBarriers(image.GetBarriers(
+				    vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT, access,
+				    Image::DestinationStages(access), {}));
 			} else if ((image.binding.force_general || image.binding.is_target) &&
 			           !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write

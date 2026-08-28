@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -35,6 +36,7 @@ struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+struct OcclusionQueryScope;
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -91,6 +93,12 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	void BeginOcclusionQuery(uint64_t begin_address);
+	void EndOcclusionQuery(uint64_t end_address);
+	void MarkOcclusionConservativeVisible() const;
+	[[nodiscard]] bool SupportsOcclusionQueries() const noexcept {
+		return m_occlusion_query_pool != nullptr;
+	}
 	void WaitForFenceOnly();
 	void WaitForFence();
 	void WaitForFenceAndReset();
@@ -101,6 +109,9 @@ public:
 	[[nodiscard]] bool              IsExecute() const { return m_execute; }
 
 private:
+	void BeginOcclusionSegment() const;
+	void CompleteOcclusionSegment(uint32_t query,
+	                              const std::shared_ptr<OcclusionQueryScope>& scope) const;
 	void Release();
 	void FinalizeFence(bool reset_recording);
 
@@ -120,6 +131,12 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering = false;
+
+	static constexpr uint32_t OcclusionQueryCapacity = 4096;
+	vk::QueryPool       m_occlusion_query_pool = nullptr;
+	mutable uint32_t    m_occlusion_query_cursor = 0;
+	mutable std::optional<uint32_t> m_active_occlusion_query;
+	mutable std::shared_ptr<OcclusionQueryScope> m_occlusion_scope;
 };
 
 class RenderCommandBuffer final: public CommandBuffer {

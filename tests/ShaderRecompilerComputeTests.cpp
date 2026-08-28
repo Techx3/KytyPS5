@@ -44,8 +44,10 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/padData.h"
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
@@ -336,6 +338,21 @@ struct TextureCacheTestAccess {
     cache.AssociateStencil(depth, stencil);
   }
 
+  static ImageId FindDepthAssociation(TextureCache &cache, GuestRange stencil,
+                                      ImageId depth) {
+    std::lock_guard lock(cache.m_lock);
+    ImageId association{};
+    for (const auto id :
+         cache.FindImagesInRegion(stencil.address, stencil.size, false)) {
+      const auto *owner = cache.m_slot_images.try_get(id);
+      if (owner != nullptr && owner->info.data == stencil &&
+          owner->depth_id == depth) {
+        association = id;
+      }
+    }
+    return association;
+  }
+
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
     cache.m_readback_linear_images = enabled;
   }
@@ -359,6 +376,10 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void BindImage(RenderExecutor &executor, ImageId id, bool storage) {
+    executor.BindImage(id, storage);
+  }
+
   static TextureBinding
   ResolveTexture(RenderExecutor &executor,
                  const ShaderRecompiler::IR::ImageResource &resource,
@@ -887,6 +908,7 @@ void EnsureConfigInitialized() {
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    subsystems.Initialize<Libs::Controller::Lifecycle>();
     config_initialized = true;
   }
 }
@@ -2952,6 +2974,7 @@ public:
     constexpr uint64_t first_offset = 0x100;
     constexpr uint64_t second_offset = 0x200;
     constexpr uint64_t clean_offset = 0x300;
+    constexpr uint64_t shader_table_offset = 0x380;
     constexpr uint64_t unmap_offset = 0x4100;
     constexpr uint64_t partial_unmap_offset = 0x8100;
     constexpr uint64_t partial_unmap_survivor_offset = 0xc100;
@@ -2962,6 +2985,8 @@ public:
     constexpr uint32_t first_stale = 0x0badf00du;
     constexpr uint32_t second_stale = 0xdeadbeefu;
     constexpr uint32_t clean_value = 0xaabbccddu;
+    constexpr uint32_t shader_table_stale = 0x13579bdfu;
+    constexpr uint32_t shader_table_value = 0x2468ace0u;
     constexpr uint32_t unmap_value = 0x91a2b3c4u;
     constexpr uint32_t remap_value = 0xd5e6f708u;
     constexpr uint32_t partial_unmap_value = 0x62738495u;
@@ -2996,6 +3021,8 @@ public:
     std::memcpy(memory + first_offset, &first_stale, sizeof(first_stale));
     std::memcpy(memory + second_offset, &second_stale, sizeof(second_stale));
     std::memcpy(memory + clean_offset, &clean_value, sizeof(clean_value));
+    std::memcpy(memory + shader_table_offset, &shader_table_stale,
+                sizeof(shader_table_stale));
 
     {
       GpuResourceManager resources(m_runtime_context, scheduler);
@@ -3032,6 +3059,45 @@ public:
         DestroyBuffer(&readback);
         return value;
       };
+
+      bool shader_table_clean_before = true;
+      bool shader_table_synchronized = false;
+      bool shader_table_clean_after = false;
+      uint32_t shader_table_observed = 0;
+      Libs::LibKernel::Memory::InstallGpuResources(&resources);
+      gpu.SendCommandSync([&] {
+        auto allocation =
+            cache.ObtainBuffer(base + shader_table_offset,
+                               sizeof(shader_table_value), true, false);
+        Require(name, "shader-table allocation", allocation.first != nullptr,
+                "shader specialization table allocation failed");
+        cache.FillBuffer(base + shader_table_offset, sizeof(shader_table_value),
+                         shader_table_value, false);
+        uint32_t clean_value_before = 0;
+        shader_table_clean_before =
+            Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+                base + shader_table_offset, &clean_value_before,
+                sizeof(clean_value_before));
+        shader_table_synchronized =
+            Libs::LibKernel::Memory::TryReadGpuSynchronizedBacking(
+                base + shader_table_offset, &shader_table_observed,
+                sizeof(shader_table_observed));
+        uint32_t clean_value_after = 0;
+        shader_table_clean_after =
+            Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+                base + shader_table_offset, &clean_value_after,
+                sizeof(clean_value_after)) &&
+            clean_value_after == shader_table_value;
+      });
+      Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+      Require(
+          name, "shader-table synchronized read",
+          !shader_table_clean_before && shader_table_synchronized &&
+              shader_table_clean_after &&
+              shader_table_observed == shader_table_value &&
+              !cache.HasGpuDirtyBytes(base + shader_table_offset,
+                                      sizeof(shader_table_value)),
+          "shader specialization did not publish a GPU-written scalar table");
 
       constexpr uint64_t large_copy_source_offset = 0x40000;
       constexpr uint64_t large_copy_destination_offset = 0x80000;
@@ -4039,6 +4105,51 @@ public:
             desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
             return desc;
           };
+
+      constexpr uint64_t depth_layout_merge_offset = 0x2780000;
+      const std::array<uint32_t, 4> depth_layout_merge_values{
+          0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+      std::memcpy(memory + depth_layout_merge_offset,
+                  depth_layout_merge_values.data(),
+                  sizeof(depth_layout_merge_values));
+      auto mip_color = MakeLinearDesc(
+          base + depth_layout_merge_offset, 3 * sizeof(uint32_t),
+          vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(uint32_t), 1);
+      mip_color.info.resources = {2, 1};
+      mip_color.info.mip_layout[0] = {0, 2 * sizeof(uint32_t), 2, 1};
+      mip_color.info.mip_layout[1] = {2 * sizeof(uint32_t), sizeof(uint32_t), 1,
+                                      1};
+      mip_color.view_info.level_count = 2;
+      const auto mip_color_image = texture_cache.FindImage(mip_color);
+      (void)texture_cache.FindTexture(mip_color_image, mip_color);
+
+      auto topology_depth = MakeLinearDesc(
+          base + depth_layout_merge_offset, sizeof(depth_layout_merge_values),
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 2, sizeof(uint32_t), 1);
+      topology_depth.type = BindingType::DepthTarget;
+      topology_depth.view_info.format = vk::Format::eD32Sfloat;
+      topology_depth.view_info.type = vk::ImageViewType::e2DArray;
+      topology_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      topology_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto topology_depth_image = texture_cache.FindImage(topology_depth);
+      const auto *topology_depth_owner =
+          TextureCacheTestAccess::Owner(texture_cache, topology_depth_image);
+      Require(name, "depth overlap keeps one coherent layout",
+              topology_depth_image && topology_depth_image != mip_color_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    mip_color_image) &&
+                  topology_depth_owner != nullptr &&
+                  topology_depth_owner->info.data == topology_depth.info.data &&
+                  topology_depth_owner->info.resources ==
+                      ImageSubresources{1, 2} &&
+                  topology_depth_owner->info.mip_layout ==
+                      topology_depth.info.mip_layout,
+              "depth/color replacement mixed the guest range and mip layout "
+              "with cached subresource counts");
+
       const auto HostReadBarrier = [&](vk::Buffer buffer, uint64_t size,
                                        vk::PipelineStageFlags source_stage,
                                        vk::AccessFlags source_access) {
@@ -4070,7 +4181,6 @@ public:
             vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barrier,
             0, nullptr);
       };
-
       // A formatted Buffer read must use the private
       // Exercise the cache-native image-copy path. Use a request larger
       // than the stream shortcut and poison guest backing
@@ -5083,6 +5193,7 @@ public:
               !resources.GetBufferCache().HasGpuDirtyBytes(
                   base + publish_buffer_offset, sizeof(publish_buffer_value)),
               "clean neighboring buffer unexpectedly became GPU-owned");
+
       uint32_t published_image_backing = 0;
       uint32_t published_buffer_backing = 0;
       std::memcpy(&published_image_backing, memory + publish_image_offset,
@@ -5300,8 +5411,8 @@ public:
                   layered_native.info.resources ==
                       layered_color.info.resources &&
                   layered_native.IsGpuModified(),
-              "depth/color conversion did not use the lexicographic "
-              "resource maximum");
+              "depth/color conversion did not retain the complete cached "
+              "resource layout");
       const volatile auto layered_guest_byte =
           *reinterpret_cast<const volatile uint8_t *>(memory + layered_offset);
       (void)layered_guest_byte;
@@ -6754,6 +6865,165 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckByteGeometryAlias() {
+    constexpr const char *name = "ByteGeometryAlias";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t allocation_size = 0x2800000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint64_t alias_size = 0x870000;
+    constexpr uint64_t metadata_offset = 0x1000000;
+    constexpr uint64_t metadata_size = 0x10000;
+    EnsureRuntimeContext();
+
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "alias direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "alias fixed mapping failed");
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, allocation_size);
+      const std::vector<uint8_t> initial(alias_size, 0xa5);
+      Libs::LibKernel::Memory::WriteBacking(base, initial.data(),
+                                            initial.size());
+      auto &cache = resources.GetTextureCache();
+
+      const auto MakeAliasDesc = [](uint64_t address, vk::Format format,
+                                    Prospero::BufferFormat guest_format,
+                                    vk::Extent3D extent,
+                                    uint32_t bytes_per_block) {
+        ImageDesc desc{};
+        desc.type = BindingType::Texture;
+        desc.info.data = {address, alias_size};
+        desc.info.pixel_format = format;
+        desc.info.guest_format = guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = extent;
+        desc.info.resources = {1, 1};
+        desc.info.pitch = extent.width;
+        desc.info.bytes_per_block = bytes_per_block;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+        desc.info.mip_layout[0] = {0, alias_size, extent.width, extent.height};
+        desc.view_info.format = format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+
+      auto source = MakeAliasDesc(base, vk::Format::eR8G8B8A8Unorm,
+                                  Prospero::BufferFormat::k8_8_8_8UNorm,
+                                  {1920, 1080, 1}, 4);
+      source.type = BindingType::RenderTarget;
+      source.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      source.info.metadata.kind = ImageMetadataKind::Dcc;
+      source.info.metadata.range = {base + metadata_offset, metadata_size};
+      source.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto source_id = cache.FindImage(source);
+      (void)cache.FindRenderTarget(source_id, source);
+      Require(name, "source clear",
+              cache.ClearImageFromBuffer(scheduler.Current(), base, alias_size,
+                                         0x44332211u),
+              "failed to create GPU-current tiled RGBA8 contents");
+      Require(name, "source download",
+              TextureCacheTestAccess::TryDownload(cache, source_id),
+              "the tiled RGBA8 owner could not be downloaded");
+      scheduler.FinishCurrent();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint8_t> expected(alias_size);
+      Require(name, "source backing read",
+              Libs::LibKernel::Memory::TryReadBacking(base, expected.data(),
+                                                      expected.size()),
+              "the tiled RGBA8 baseline backing was unreadable");
+      Require(name, "source contents",
+              std::any_of(expected.begin(), expected.end(),
+                          [](uint8_t value) { return value != 0; }),
+              "the tiled RGBA8 baseline was unexpectedly empty");
+      auto stale = expected;
+      std::fill_n(stale.begin(), 0x10000, uint8_t{0});
+      Libs::LibKernel::Memory::WriteBacking(base, stale.data(), stale.size());
+
+      auto destination =
+          MakeAliasDesc(base, vk::Format::eR8Uint,
+                        Prospero::BufferFormat::k8UInt, {3840, 2160, 1}, 1);
+      destination.info.tile_mode = Prospero::TileMode::kDepth;
+      const auto destination_id = cache.FindImage(destination);
+      const auto destination_view =
+          cache.FindTexture(destination_id, destination);
+      const bool destination_download =
+          TextureCacheTestAccess::TryDownload(cache, destination_id);
+      scheduler.FinishCurrent();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint8_t> observed(alias_size);
+      Require(name, "destination backing read",
+              Libs::LibKernel::Memory::TryReadBacking(base, observed.data(),
+                                                      observed.size()),
+              "the tiled R8 destination backing was unreadable");
+
+      Require(name, "replacement",
+              destination_view != nullptr && destination_id != source_id &&
+                  !TextureCacheTestAccess::Contains(cache, source_id) &&
+                  cache.GetImage(destination_id).IsGpuModified(),
+              "equal-range RGBA8/R8 aliases did not transfer native "
+              "ownership while changing element geometry");
+      Require(name, "destination download", destination_download,
+              "the reinterpreted tiled R8 owner could not be downloaded");
+      Require(name, "contents", observed == expected,
+              "equal-range tiled RGBA8/R8 aliases lost GPU-native bytes");
+
+      const auto roundtrip_id = cache.FindImage(source);
+      const auto roundtrip_view = cache.FindRenderTarget(roundtrip_id, source);
+      const bool roundtrip_download =
+          TextureCacheTestAccess::TryDownload(cache, roundtrip_id);
+      scheduler.FinishCurrent();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint8_t> roundtrip(alias_size);
+      Require(name, "roundtrip backing read",
+              Libs::LibKernel::Memory::TryReadBacking(base, roundtrip.data(),
+                                                      roundtrip.size()),
+              "the tiled RGBA8 roundtrip backing was unreadable");
+      Require(name, "DCC roundtrip",
+              roundtrip_view != nullptr && roundtrip_id != destination_id &&
+                  !TextureCacheTestAccess::Contains(cache, destination_id) &&
+                  cache.IsMeta(base + metadata_offset) &&
+                  !cache.IsMetaCleared(base + metadata_offset, 0) &&
+                  roundtrip_download && roundtrip == expected,
+              "R8/DCC-RGBA8 roundtrip lost native bytes or metadata ownership");
+
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "alias fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "alias direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -7313,7 +7583,7 @@ public:
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x180000;
+    constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -7421,6 +7691,89 @@ public:
                                                            null_image_id),
               "the shared null image did not preserve texture/storage "
               "acquisition without guest readback or RenderExecutor ownership");
+
+      ShaderTextureResource oversized_indirect{};
+      const uint64_t oversized_address = base + allocation_size - 0x10000u;
+      const auto encoded_oversized_address = oversized_address >> 8u;
+      oversized_indirect.fields[0] =
+          static_cast<uint32_t>(encoded_oversized_address);
+      oversized_indirect.fields[1] =
+          static_cast<uint32_t>(encoded_oversized_address >> 32u) |
+          (static_cast<uint32_t>(stencil_format) << 20u) | (3u << 30u);
+      oversized_indirect.fields[2] = 31u | (31u << 14u);
+      oversized_indirect.fields[3] =
+          DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(linear) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+      oversized_indirect.fields[4] = 127u;
+      ShaderRecompiler::IR::DescriptorValue oversized_descriptor{};
+      std::copy(std::begin(oversized_indirect.fields),
+                std::end(oversized_indirect.fields),
+                oversized_descriptor.dwords.begin());
+      oversized_descriptor.dword_count = 8;
+      auto oversized_resource = null_resource;
+      oversized_resource.dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+      oversized_resource.indirect_root = 0;
+      const auto oversized_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, oversized_resource, oversized_descriptor);
+      Require(name, "oversized indirect image candidate",
+              oversized_binding.desc.info.data.Empty() &&
+                  texture_cache.GetImage(oversized_binding.image_id)
+                      .info.data.Empty(),
+              "an indirect image candidate exceeding its mapped allocation was "
+              "materialized");
+
+      ShaderTextureResource invalid_tiled_indirect{};
+      const auto encoded_base = static_cast<uint64_t>(base) >> 8u;
+      constexpr uint32_t captured_width = 14630u;
+      constexpr uint32_t captured_height = 237u;
+      constexpr uint32_t encoded_width = captured_width - 1u;
+      invalid_tiled_indirect.fields[0] = static_cast<uint32_t>(encoded_base);
+      invalid_tiled_indirect.fields[1] =
+          static_cast<uint32_t>(encoded_base >> 32u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k16SNorm) << 20u) |
+          ((encoded_width & 3u) << 30u);
+      invalid_tiled_indirect.fields[2] =
+          ((encoded_width >> 2u) & 0xfffu) | ((captured_height - 1u) << 14u);
+      invalid_tiled_indirect.fields[3] =
+          DstSel(4, 5, 6, 7) | (28u << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      invalid_tiled_indirect.fields[5] = 0x00700000u | (14u << 4u);
+      ShaderRecompiler::IR::DescriptorValue invalid_tiled_descriptor{};
+      std::copy(std::begin(invalid_tiled_indirect.fields),
+                std::end(invalid_tiled_indirect.fields),
+                invalid_tiled_descriptor.dwords.begin());
+      invalid_tiled_descriptor.dword_count = 8;
+      auto invalid_tiled_resource = null_resource;
+      invalid_tiled_resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+      invalid_tiled_resource.indirect_root = 0;
+      const auto invalid_tiled_binding =
+          RenderExecutorTestAccess::ResolveTexture(
+              executor, invalid_tiled_resource, invalid_tiled_descriptor);
+      Require(name, "invalid indirect tiled candidate",
+              invalid_tiled_binding.desc.info.data.Empty() &&
+                  texture_cache.GetImage(invalid_tiled_binding.image_id)
+                      .info.data.Empty(),
+              "an invalid indirect tiled candidate reached the texture tiler");
+
+      ShaderRecompiler::IR::DescriptorValue captured_float_descriptor{};
+      captured_float_descriptor.dwords = {0x3f352000u, 0xc121a9c6u, 0x40d09321u,
+                                          0xc097c45au, 0x00000000u, 0xbf351708u,
+                                          0xbf2a653bu, 0xbe73915au};
+      captured_float_descriptor.dword_count = 8;
+      auto captured_float_resource = null_resource;
+      captured_float_resource.dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+      captured_float_resource.indirect_root = 0;
+      const auto captured_float_binding =
+          RenderExecutorTestAccess::ResolveTexture(
+              executor, captured_float_resource, captured_float_descriptor);
+      Require(name, "captured indirect float data",
+              captured_float_binding.desc.info.data.Empty() &&
+                  texture_cache.GetImage(captured_float_binding.image_id)
+                      .info.data.Empty(),
+              "captured non-texture data reached texture resolution");
+
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), null_bindings));
       Require(name, "null descriptor general layouts",
@@ -8660,6 +9013,195 @@ public:
                   !texture_cache.GetImage(depth_id).binding.is_target,
               "RenderExecutor retained target binding state after reset");
 
+      constexpr uint32_t tiled_stencil_width = 256;
+      constexpr uint32_t tiled_stencil_height = 256;
+      constexpr uint64_t tiled_depth_address = base + 0x180000;
+      constexpr uint64_t tiled_stencil_address = base + 0x1c0000;
+      TileSizeAlign tiled_depth_layout{};
+      TileSizeAlign tiled_stencil_layout{};
+      TileSizeAlign tiled_htile_layout{};
+      Require(
+          name, "tiled stencil footprint",
+          TileGetDepthSize(tiled_stencil_width, tiled_stencil_height, 0,
+                           Prospero::DepthFormat::kZ32F,
+                           Prospero::StencilFormat::k8UInt, false,
+                           tiled_stencil_layout, tiled_htile_layout,
+                           tiled_depth_layout) &&
+              tiled_depth_layout.size == 0x40000 &&
+              tiled_stencil_layout.size == 0x10000,
+          "the depth-tiled R8 stencil fixture has an unexpected footprint");
+
+      ImageDesc tiled_depth{};
+      tiled_depth.type = BindingType::DepthTarget;
+      tiled_depth.info.data = {tiled_depth_address, tiled_depth_layout.size};
+      tiled_depth.info.stencil = {tiled_stencil_address,
+                                  tiled_stencil_layout.size};
+      tiled_depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      tiled_depth.info.guest_format = Prospero::BufferFormat::k32Float;
+      tiled_depth.info.type = Prospero::ImageType::kColor2D;
+      tiled_depth.info.extent = {tiled_stencil_width, tiled_stencil_height, 1};
+      tiled_depth.info.resources = {1, 1};
+      tiled_depth.info.pitch =
+          TileGetDepthPitch(tiled_stencil_width, sizeof(float), 0);
+      tiled_depth.info.bytes_per_block = sizeof(float);
+      tiled_depth.info.samples = 1;
+      tiled_depth.info.tile_mode = Prospero::TileMode::kDepth;
+      tiled_depth.info.mip_layout[0] = {0, tiled_depth_layout.size,
+                                        tiled_depth.info.pitch,
+                                        tiled_stencil_height};
+      tiled_depth.view_info.format = tiled_depth.info.pixel_format;
+      tiled_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
+                                     vk::ImageAspectFlagBits::eStencil;
+      tiled_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto tiled_depth_id = texture_cache.FindImage(tiled_depth);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, tiled_depth_id, tiled_depth.info.stencil);
+      const auto tiled_stencil_proxy = texture_cache.FindImageFromRange(
+          tiled_stencil_address, tiled_stencil_layout.size, false);
+
+      ImageDesc tiled_stencil{};
+      tiled_stencil.type = BindingType::Texture;
+      tiled_stencil.info.data = tiled_depth.info.stencil;
+      tiled_stencil.info.pixel_format = vk::Format::eR8Uint;
+      tiled_stencil.info.guest_format = Prospero::BufferFormat::k8UInt;
+      tiled_stencil.info.type = Prospero::ImageType::kColor2D;
+      tiled_stencil.info.extent = tiled_depth.info.extent;
+      tiled_stencil.info.resources = tiled_depth.info.resources;
+      tiled_stencil.info.pitch = TileGetTexturePitch(
+          tiled_stencil.info.guest_format, tiled_stencil_width,
+          Prospero::TileMode::kDepth);
+      tiled_stencil.info.bytes_per_block = 1;
+      tiled_stencil.info.samples = 1;
+      tiled_stencil.info.tile_mode = Prospero::TileMode::kDepth;
+      tiled_stencil.info.mip_layout[0] = {
+          0, tiled_stencil_layout.size, tiled_stencil.info.pitch,
+          tiled_stencil_height};
+      tiled_stencil.view_info.format = tiled_stencil.info.pixel_format;
+      tiled_stencil.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      tiled_stencil.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto resolved_tiled_stencil =
+          texture_cache.FindImage(tiled_stencil);
+      Require(
+          name, "depth-first tiled stencil alias",
+          tiled_stencil_proxy && resolved_tiled_stencil == tiled_stencil_proxy &&
+              texture_cache.GetImage(tiled_stencil_proxy).depth_id ==
+                  tiled_depth_id &&
+              texture_cache.GetImage(tiled_stencil_proxy).backing.image ==
+                  nullptr &&
+              texture_cache.GetImage(tiled_depth_id).backing.image != nullptr,
+          "an R8 kDepth lookup reinterpreted the pre-existing stencil proxy");
+
+      constexpr uint32_t array_stencil_width = 4;
+      constexpr uint32_t array_stencil_height = 4;
+      constexpr uint32_t array_stencil_layers = 2;
+      constexpr uint64_t array_depth_address = base + 0x1d0000;
+      constexpr uint64_t array_stencil_address = base + 0x1e0000;
+      TileSizeAlign array_stencil_layout{};
+      TileGetTextureTotalSize(Prospero::BufferFormat::k8UInt,
+                              array_stencil_width, array_stencil_height, 1,
+                              array_stencil_layers, linear, false,
+                              array_stencil_layout);
+      Require(name, "array stencil footprint",
+              array_stencil_layout.size != 0 &&
+                  array_stencil_layout.align != 0 &&
+                  (array_stencil_address &
+                   (array_stencil_layout.align - 1u)) == 0,
+              "linear array stencil descriptor produced an invalid footprint");
+
+      ImageDesc array_depth{};
+      array_depth.type = BindingType::DepthTarget;
+      array_depth.info.data = {array_depth_address, 0x10000};
+      array_depth.info.stencil = {array_stencil_address,
+                                  array_stencil_layout.size};
+      array_depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      array_depth.info.guest_format = Prospero::BufferFormat::k32Float;
+      array_depth.info.type = Prospero::ImageType::kColor2D;
+      array_depth.info.extent = {array_stencil_width, array_stencil_height, 1};
+      array_depth.info.resources = {1, array_stencil_layers};
+      array_depth.info.pitch = array_stencil_width;
+      array_depth.info.bytes_per_block = sizeof(float);
+      array_depth.info.samples = 1;
+      array_depth.info.tile_mode = linear;
+      array_depth.info.mip_layout[0] = {0, array_depth.info.data.size,
+                                        array_depth.info.pitch,
+                                        array_stencil_height};
+      array_depth.view_info.format = array_depth.info.pixel_format;
+      array_depth.view_info.type = vk::ImageViewType::e2DArray;
+      array_depth.view_info.layer_count = array_stencil_layers;
+      array_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
+                                     vk::ImageAspectFlagBits::eStencil;
+      array_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto array_depth_id = texture_cache.FindImage(array_depth);
+
+      ImageDesc array_stencil{};
+      array_stencil.type = BindingType::Texture;
+      array_stencil.info.data = array_depth.info.stencil;
+      array_stencil.info.pixel_format = vk::Format::eR8Uint;
+      array_stencil.info.guest_format = Prospero::BufferFormat::k8UInt;
+      array_stencil.info.type = Prospero::ImageType::kColor2D;
+      array_stencil.info.extent = array_depth.info.extent;
+      array_stencil.info.resources = array_depth.info.resources;
+      array_stencil.info.pitch = TileGetTexturePitch(
+          array_stencil.info.guest_format, array_stencil_width, linear);
+      array_stencil.info.bytes_per_block = 1;
+      array_stencil.info.samples = 1;
+      array_stencil.info.tile_mode = linear;
+      array_stencil.info.mip_layout[0] = {
+          0, array_stencil_layout.size, array_stencil.info.pitch,
+          array_stencil_height};
+      array_stencil.view_info.format = array_stencil.info.pixel_format;
+      array_stencil.view_info.type = vk::ImageViewType::e2DArray;
+      array_stencil.view_info.layer_count = array_stencil_layers;
+      array_stencil.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      array_stencil.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto compatible_sampled_stencil =
+          texture_cache.FindImage(array_stencil);
+      RenderExecutorTestAccess::BindImage(executor,
+                                          compatible_sampled_stencil, false);
+
+      ImageInfo same_start_different_size{};
+      same_start_different_size.data = {
+          array_stencil_address, array_stencil_layout.size + 0x100};
+      same_start_different_size.extent = array_depth.info.extent;
+      const auto mismatched_stencil_record =
+          TextureCacheTestAccess::InsertImage(texture_cache,
+                                              same_start_different_size);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, array_depth_id, array_depth.info.stencil);
+      const auto array_stencil_proxy = texture_cache.FindImageFromRange(
+          array_stencil_address, array_stencil_layout.size, false);
+      Require(
+          name, "exact stencil association range",
+          array_stencil_proxy &&
+              array_stencil_proxy == compatible_sampled_stencil &&
+              array_stencil_proxy != mismatched_stencil_record &&
+              !texture_cache.GetImage(mismatched_stencil_record).depth_id &&
+              texture_cache.GetImage(array_stencil_proxy).depth_id ==
+                  array_depth_id &&
+              texture_cache.GetImage(array_stencil_proxy)
+                  .binding.needs_rebind,
+          "a same-address image with a different size was used as the stencil "
+          "association record or its active sampled owner was not rebound");
+      TextureCacheTestAccess::DeleteImage(texture_cache,
+                                          mismatched_stencil_record);
+
+      const auto resolved_array_stencil =
+          texture_cache.FindImage(array_stencil);
+      const auto exact_array_stencil =
+          texture_cache.FindImage(array_stencil, true);
+      Require(
+          name, "array stencil proxy preservation",
+          resolved_array_stencil == array_stencil_proxy &&
+              exact_array_stencil == array_stencil_proxy &&
+              texture_cache.GetImage(array_stencil_proxy).depth_id ==
+                  array_depth_id &&
+              texture_cache.GetImage(array_depth_id).backing.layers ==
+                  array_stencil_layers,
+          "an array R8 stencil lookup did not preserve its association "
+          "record or resolve through the layered depth owner");
+
       constexpr uint64_t ordered_color_address = base + 0x80000;
       auto ordered_color_desc =
           make_target_desc(ordered_color_address, target_mip_size, {1, 1, 1});
@@ -8690,6 +9232,10 @@ public:
       ordered_depth.image_id = ordered_depth_id;
       auto ordered_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &ordered_color, 1, ordered_depth);
+      const auto ordered_stencil_proxy =
+          TextureCacheTestAccess::FindDepthAssociation(
+              texture_cache, ordered_depth_desc.info.stencil,
+              ordered_depth.image_id);
       Require(name, "color-before-depth acquisition order",
               ordered_color.image_id != stale_ordered_color &&
                   ordered_color.image_view != nullptr &&
@@ -8698,10 +9244,13 @@ public:
                       ordered_color.image_view &&
                   ordered_rendering.depth_stencil_attachment.image_view ==
                       ordered_depth.image_view &&
-                  texture_cache.GetImage(ordered_color.image_id).depth_id ==
+                  !texture_cache.GetImage(ordered_color.image_id).depth_id &&
+                  ordered_stencil_proxy &&
+                  ordered_stencil_proxy != ordered_color.image_id &&
+                  texture_cache.GetImage(ordered_stencil_proxy).depth_id ==
                       ordered_depth.image_id,
               "depth acquisition ran before the stale color target was "
-              "recreated and associated");
+              "recreated or reused the unrelated color target as stencil");
       RenderExecutorTestAccess::ResetBindings(executor);
       TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
 
@@ -8737,54 +9286,134 @@ public:
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(snapshot))};
 
+      constexpr uint64_t rediscovery_depth_address = base + 0x150000;
+      constexpr uint64_t rediscovery_stencil_address = base + 0x160000;
+      auto rediscovery_depth = depth;
+      rediscovery_depth.info.data.address = rediscovery_depth_address;
+      rediscovery_depth.info.stencil.address = rediscovery_stencil_address;
+      const auto rediscovery_depth_id =
+          texture_cache.FindImage(rediscovery_depth);
+
+      auto rediscovery_stencil = stencil;
+      const uint64_t rediscovery_encoded_address =
+          rediscovery_stencil_address >> 8u;
+      rediscovery_stencil.fields[0] =
+          static_cast<uint32_t>(rediscovery_encoded_address);
+      rediscovery_stencil.fields[1] =
+          (rediscovery_stencil.fields[1] & ~0xffu) |
+          static_cast<uint32_t>(rediscovery_encoded_address >> 32u);
+      ShaderRecompiler::IR::DescriptorValue rediscovery_descriptor{};
+      std::copy(std::begin(rediscovery_stencil.fields),
+                std::end(rediscovery_stencil.fields),
+                rediscovery_descriptor.dwords.begin());
+      rediscovery_descriptor.dword_count = 8;
+
+      auto rediscovery_sampled_program =
+          std::make_shared<ShaderRecompiler::IR::Program>(*runtime.program);
+      rediscovery_sampled_program->info.images.push_back(
+          rediscovery_sampled_program->info.images.front());
+      auto rediscovery_sampled_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      rediscovery_sampled_snapshot->images.assign(2, rediscovery_descriptor);
+      ShaderStageRuntime rediscovery_sampled_runtime{
+          std::move(rediscovery_sampled_program),
+          std::move(rediscovery_sampled_snapshot)};
+      auto rediscovery_sampled =
+          executor.PrepareBindings(rediscovery_sampled_runtime);
+      const auto rediscovery_proxy_id =
+          rediscovery_sampled.resources.images[0].image_id;
+      Require(
+          name, "shared sampled stencil discovery",
+          rediscovery_sampled.resources.images.size() == 2 &&
+              rediscovery_proxy_id != rediscovery_depth_id &&
+              rediscovery_sampled.resources.images[1].image_id ==
+                  rediscovery_proxy_id &&
+              texture_cache.GetImage(rediscovery_proxy_id).binding.is_bound &&
+              !texture_cache.GetImage(rediscovery_proxy_id)
+                   .binding.shader_write &&
+              !texture_cache.GetImage(rediscovery_proxy_id).depth_id,
+          "identical sampled descriptors did not share the pre-association R8 "
+          "owner");
+
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, rediscovery_depth_id,
+          rediscovery_depth.info.stencil);
+      Require(
+          name, "shared sampled stencil invalidation",
+          texture_cache.GetImage(rediscovery_proxy_id).depth_id ==
+                  rediscovery_depth_id &&
+              texture_cache.GetImage(rediscovery_proxy_id)
+                  .binding.needs_rebind,
+          "stencil association did not invalidate the shared sampled owner");
+
+      auto rediscovery_storage_program =
+          std::make_shared<ShaderRecompiler::IR::Program>(*runtime.program);
+      rediscovery_storage_program->info.images[0].kind =
+          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      rediscovery_storage_program->info.images[0].read = false;
+      rediscovery_storage_program->info.images[0].written = true;
+      auto rediscovery_storage_descriptor = rediscovery_descriptor;
+      rediscovery_storage_descriptor.dwords[5] = 0x00700000u;
+      auto rediscovery_storage_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      rediscovery_storage_snapshot->images.push_back(
+          rediscovery_storage_descriptor);
+      ShaderStageRuntime rediscovery_storage_runtime{
+          std::move(rediscovery_storage_program),
+          std::move(rediscovery_storage_snapshot)};
+      auto rediscovery_storage =
+          executor.PrepareBindings(rediscovery_storage_runtime);
+      executor.RebindImages(rediscovery_storage);
+      const auto rediscovery_storage_id =
+          rediscovery_storage.resources.images[0].image_id;
+      const auto rediscovery_storage_backing =
+          texture_cache.GetImage(rediscovery_storage_id).backing.image;
+      Require(
+          name, "shared stencil storage alias",
+          rediscovery_storage_id != rediscovery_depth_id &&
+              rediscovery_storage_id != rediscovery_proxy_id &&
+              rediscovery_storage.resources.images[0].image_view != nullptr &&
+              !texture_cache.GetImage(rediscovery_storage_id).depth_id &&
+              texture_cache.GetImage(rediscovery_storage_id).usage.storage,
+          "storage acquisition reused the sampled stencil proxy or depth owner");
+
+      executor.RebindImages(rediscovery_sampled);
+      Require(
+          name, "shared stencil rediscovery",
+          rediscovery_sampled.resources.images[0].image_id ==
+                  rediscovery_depth_id &&
+              rediscovery_sampled.resources.images[1].image_id ==
+                  rediscovery_depth_id &&
+              rediscovery_sampled.resources.images[0].image_view != nullptr &&
+              rediscovery_sampled.resources.images[1].image_view != nullptr &&
+              texture_cache.GetImage(rediscovery_proxy_id).depth_id ==
+                  rediscovery_depth_id &&
+              !texture_cache.GetImage(rediscovery_proxy_id).binding.is_bound &&
+              texture_cache.GetImage(rediscovery_storage_id).backing.image ==
+                  rediscovery_storage_backing &&
+              !texture_cache.GetImage(rediscovery_storage_id).depth_id,
+          "one shared proxy cleared rediscovery state before every descriptor "
+          "was redirected to the depth owner");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
       auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
-      const auto sampled_stencil_id = prepared.resources.images[0].image_id;
-      Require(name, "first stencil discovery",
+      Require(name, "associated stencil discovery",
               prepared.resources.images.size() == 1 &&
-                  sampled_stencil_id != depth_id &&
+                  prepared.resources.images[0].image_id == depth_id &&
                   prepared.resources.images[0].image_view == nullptr &&
-                  texture_cache.GetImage(sampled_stencil_id).binding.is_bound &&
+                  texture_cache.GetImage(depth_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_target,
-              "the first sampled-stencil lookup did not remain an ordinary "
-              "discovery before final depth acquisition");
+              "the sampled R8 stencil proxy did not immediately select its "
+              "depth/stencil owner");
 
       context.GetRenderExecutor().RebindImages(prepared);
-      Require(name, "first stencil acquisition",
-              prepared.resources.images[0].image_id == sampled_stencil_id &&
+      Require(name, "associated stencil acquisition",
+              prepared.resources.images[0].image_id == depth_id &&
                   prepared.resources.images[0].image_view != nullptr &&
-                  texture_cache.GetImage(sampled_stencil_id).usage.texture,
-              "the first sampled-stencil image was not finally acquired");
-
-      RenderExecutorTestAccess::ResetBindings(executor);
-      RenderDepthInfo reassociated_depth = rebound_depth;
-      reassociated_depth.image_view = nullptr;
-      RenderColorInfo no_reassociated_color{};
-      (void)RenderExecutorTestAccess::AcquireRenderTargets(
-          executor, scheduler.Current(), &no_reassociated_color, 0,
-          reassociated_depth);
-      Require(name, "existing stencil association selection",
-              texture_cache.GetImage(sampled_stencil_id).depth_id ==
-                  reassociated_depth.image_id,
-              "final depth acquisition did not associate the existing image "
-              "at the stencil guest address");
-      RenderExecutorTestAccess::ResetBindings(executor);
-
-      auto redirected = context.GetRenderExecutor().PrepareBindings(runtime);
-      Require(name, "redirected owner discovery",
-              redirected.resources.images.size() == 1 &&
-                  redirected.resources.images[0].image_id == depth_id &&
-                  redirected.resources.images[0].image_view == nullptr &&
-                  texture_cache.GetImage(depth_id).binding.is_bound &&
-                  !texture_cache.GetImage(sampled_stencil_id).binding.is_bound,
-              "the established stencil association did not redirect the next "
-              "discovery to the depth owner");
-      context.GetRenderExecutor().RebindImages(redirected);
-      Require(name, "second-pass stencil acquisition",
-              redirected.resources.images[0].image_id == depth_id &&
-                  redirected.resources.images[0].image_view != nullptr &&
                   texture_cache.GetImage(depth_id).usage.texture,
-              "RebindImages did not acquire the associated depth owner");
+              "RebindImages did not acquire the stencil view from the depth "
+              "owner");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto stencil_storage_program =
@@ -8809,12 +9438,53 @@ public:
       auto storage_redirected =
           executor.PrepareBindings(stencil_storage_runtime);
       executor.RebindImages(storage_redirected);
+      const auto storage_stencil_id =
+          storage_redirected.resources.images[0].image_id;
+      const auto storage_stencil_backing =
+          texture_cache.GetImage(storage_stencil_id).backing.image;
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, depth_id, depth.info.stencil);
       Require(
-          name, "storage stencil acquisition",
-          storage_redirected.resources.images[0].image_id == depth_id &&
+          name, "independent storage stencil acquisition",
+          storage_stencil_id != depth_id &&
+              storage_stencil_id != stencil_proxy_id &&
               storage_redirected.resources.images[0].image_view != nullptr &&
-              texture_cache.GetImage(depth_id).usage.storage,
-          "storage stencil binding did not acquire the associated depth owner");
+              !texture_cache.GetImage(storage_stencil_id).depth_id &&
+              texture_cache.GetImage(storage_stencil_id).backing.image !=
+                  nullptr &&
+              texture_cache.GetImage(storage_stencil_id).backing.image ==
+                  storage_stencil_backing &&
+              texture_cache.GetImage(storage_stencil_id).usage.storage &&
+              !texture_cache.GetImage(depth_id).usage.storage &&
+              !static_cast<bool>(
+                  texture_cache.GetImage(depth_id).backing.usage &
+                  vk::ImageUsageFlagBits::eStorage),
+          "a storage R8 descriptor was redirected to the depth owner without "
+          "native storage usage");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      auto sampled_after_storage =
+          context.GetRenderExecutor().PrepareBindings(runtime);
+      Require(
+          name, "sampled stencil after storage alias",
+          sampled_after_storage.resources.images.size() == 1 &&
+              sampled_after_storage.resources.images[0].image_id == depth_id &&
+              sampled_after_storage.resources.images[0].image_view == nullptr &&
+              texture_cache.GetImage(depth_id).binding.is_bound &&
+              !texture_cache.GetImage(storage_stencil_id).binding.is_bound &&
+              !texture_cache.GetImage(storage_stencil_id).depth_id &&
+              texture_cache.GetImage(storage_stencil_id).backing.image ==
+                  storage_stencil_backing,
+          "the independent storage backing masked the sampled stencil proxy");
+      context.GetRenderExecutor().RebindImages(sampled_after_storage);
+      Require(name, "sampled stencil owner after storage alias",
+              sampled_after_storage.resources.images[0].image_id == depth_id &&
+                  sampled_after_storage.resources.images[0].image_view !=
+                      nullptr &&
+                  texture_cache.GetImage(depth_id).usage.texture &&
+                  !texture_cache.GetImage(depth_id).usage.storage,
+              "the sampled stencil did not acquire the depth owner after an "
+              "independent storage binding");
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -10329,6 +10999,49 @@ public:
                   storage_only_surface.conversion_format ==
                       Prospero::BufferFormat::kInvalid,
               "storage-only native backing was conflated with sampled support");
+
+      constexpr auto sampled_sint_format = Prospero::BufferFormat::k16SInt;
+      const auto sampled_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_sint_format, true);
+      const auto storage_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_sint_format);
+      Require(name, "R16 SINT sampled conversion",
+              Prospero::IsSampledTextureFormat(sampled_sint_format) &&
+                  Prospero::IsSampledSintTextureFormat(sampled_sint_format) &&
+                  !Prospero::IsUintTextureFormat(sampled_sint_format) &&
+                  Prospero::RemapTextureFormat(sampled_sint_format) ==
+                      sampled_sint_format &&
+                  Prospero::RemapSampledTextureFormat(sampled_sint_format) ==
+                      Prospero::BufferFormat::k16UInt &&
+                  sampled_sint_surface.vk_format == vk::Format::eR16Uint &&
+                  sampled_sint_surface.conversion_format ==
+                      sampled_sint_format &&
+                  storage_sint_surface.vk_format == vk::Format::eR16Sint &&
+                  storage_sint_surface.conversion_format ==
+                      Prospero::BufferFormat::kInvalid,
+              "R16 SINT sampled conversion changed storage semantics");
+
+      constexpr auto sampled_rg8_sint_format = Prospero::BufferFormat::k8_8SInt;
+      const auto sampled_rg8_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_rg8_sint_format, true);
+      const auto storage_rg8_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_rg8_sint_format);
+      Require(
+          name, "RG8 SINT sampled conversion",
+          Prospero::IsSampledTextureFormat(sampled_rg8_sint_format) &&
+              Prospero::IsSampledSintTextureFormat(sampled_rg8_sint_format) &&
+              !Prospero::IsUintTextureFormat(sampled_rg8_sint_format) &&
+              Prospero::RemapTextureFormat(sampled_rg8_sint_format) ==
+                  sampled_rg8_sint_format &&
+              Prospero::RemapSampledTextureFormat(sampled_rg8_sint_format) ==
+                  Prospero::BufferFormat::k16UInt &&
+              sampled_rg8_sint_surface.vk_format == vk::Format::eR16Uint &&
+              sampled_rg8_sint_surface.conversion_format ==
+                  sampled_rg8_sint_format &&
+              storage_rg8_sint_surface.vk_format == vk::Format::eR8G8Sint &&
+              storage_rg8_sint_surface.conversion_format ==
+                  Prospero::BufferFormat::kInvalid,
+          "RG8 SINT sampled conversion changed storage semantics");
     }
 
     {
@@ -11611,6 +12324,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::TBUFFER_STORE_FORMAT_XYZ:
   case Opcode::TBUFFER_STORE_FORMAT_XYZW:
   case Opcode::BUFFER_ATOMIC_SWAP:
+  case Opcode::BUFFER_ATOMIC_CMPSWAP:
   case Opcode::BUFFER_ATOMIC_ADD:
   case Opcode::BUFFER_ATOMIC_SUB:
   case Opcode::BUFFER_ATOMIC_SMIN:
@@ -11661,6 +12375,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_READ_I16:
   case Opcode::DS_READ_U16:
   case Opcode::DS_READ_U16_D16:
+  case Opcode::DS_READ_U16_D16_HI:
   case Opcode::DS_READ2_B32:
   case Opcode::DS_READ_B32:
   case Opcode::DS_READ_B64:
@@ -12055,8 +12770,8 @@ TestCase ScalarRemainingAluOps() {
   return {"ScalarRemainingAluOps",
           code,
           {},
-          {4u, 0xffffffefu, 6u, 0xfbu, 0x0f000f00u, 0xff0fff0fu,
-           0xfff0fff0u, 0xf000f000u, 0xf00ff00fu},
+          {4u, 0xffffffefu, 6u, 0xfbu, 0x0f000f00u, 0xff0fff0fu, 0xfff0fff0u,
+           0xf000f000u, 0xf00ff00fu},
           {O::S_MOV_B32, O::S_FF1_I32_B32, O::S_NOT_B32, O::S_CMP_EQ_U32,
            O::S_SUBB_U32, O::S_BITSET0_B32, O::S_ANDN2_B32, O::S_ORN2_B32,
            O::S_NAND_B32, O::S_NOR_B32, O::S_XNOR_B32, O::V_MOV_B32,
@@ -13053,6 +13768,52 @@ TestCase Vop2SdwaSubNcExactByte2Destination() {
   return test;
 }
 
+TestCase Vop1SdwaFfblCapturedHighWordSource() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(0x7e2074f9u);
+  code.push_back(0x00050602u); // v_ffbl_b32 v16, v2.word1
+  AppendStoreVgpr(&code, 16, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaFfblCapturedHighWordSource";
+  test.code = std::move(code);
+  test.initial = {0x00400000u};
+  test.expected = {6u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_FFBL_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_FFBL_B32 v16, v2.sdwa(sel=5,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = FindILsb32 ", 1}};
+  test.required_spirv = {"OpBitFieldUExtract"};
+  return test;
+}
+
+TestCase Vop1SdwaNotCapturedByte0Source() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(0x7e046ef9u);
+  code.push_back(0x00000602u); // v_not_b32 v2, v2.byte0
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaNotCapturedByte0Source";
+  test.code = std::move(code);
+  test.initial = {0x12345678u};
+  test.expected = {0xffffff87u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_NOT_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_NOT_B32 v2, v2.sdwa(sel=0,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = BitwiseNot32 ", 1}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpNot"};
+  return test;
+}
+
 TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   using O = ShaderOpcode;
 
@@ -13506,6 +14267,18 @@ TestCase VectorMbcntUsesThreadMask() {
   return test;
 }
 
+TestCase VectorMbcntWave64UsesLogicalLaneId() {
+  auto test = VectorMbcntUsesThreadMask();
+  test.name = "VectorMbcntWave64UsesLogicalLaneId";
+  test.expected.resize(64);
+  std::iota(test.expected.begin(), test.expected.end(), 0u);
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.wave_size = 64;
+  test.dispatch_x = 1;
+  test.required_spirv = {"BuiltIn LocalInvocationIndex", "OpBitwiseAnd"};
+  return test;
+}
+
 TestCase VectorAddcUsesPerLaneCarryIn() {
   using O = ShaderOpcode;
 
@@ -13933,6 +14706,132 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ComputeFp16OverflowMode(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7bff7bffu); // packed +MAX_FP16
+  AppendVMovLiteral(&code, 1, 0x40004000u); // packed +2.0h
+  AppendVMovLiteral(&code, 2, 0x7c007c00u); // packed +Inf
+  AppendVMovLiteral(&code, 3, 0x12347bffu); // scalar +MAX_FP16
+  AppendVMovLiteral(&code, 4, 0x00004000u); // scalar +2.0h
+
+  AppendVop3p(&code, 0x10, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x10, 11, Vgpr(2), Vgpr(1), 0, 0x3);
+  code.push_back(EncodeVop2(0x35, 3, Vgpr(3), 4));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreVgpr(&code, 3, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeFp16OverflowEnabled"
+                      : "ComputeFp16OverflowDisabled";
+  test.code = std::move(code);
+  test.expected = enabled
+                      ? std::vector<u32>{0x7bff7bffu, 0x7c007c00u,
+                                         0x12347bffu}
+                      : std::vector<u32>{0x7c007c00u, 0x7c007c00u,
+                                         0x12347c00u};
+  test.opcodes = {O::V_MOV_B32, O::V_PK_MUL_F16, O::V_MUL_F16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.fp16_overflow = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ComputeDx10ClampF16Nan(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7e007e00u); // packed qNaN
+  AppendVMovLiteral(&code, 1, 0x40004000u); // packed +2.0h
+  AppendVMovLiteral(&code, 2, 0x12347e00u); // scalar qNaN
+  AppendVMovLiteral(&code, 3, 0x00004000u); // scalar +2.0h
+
+  AppendVop3p(&code, 0x11, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x12, 11, Vgpr(0), Vgpr(1), 0, 0x3);
+  code.push_back(EncodeVop2(0x3a, 2, Vgpr(2), 3));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreVgpr(&code, 2, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeDx10ClampF16NanEnabled"
+                      : "ComputeDx10ClampF16NanDisabled";
+  test.code = std::move(code);
+  test.expected = enabled
+                      ? std::vector<u32>{0x00000000u, 0x40004000u,
+                                         0x12340000u}
+                      : std::vector<u32>{0x40004000u, 0x40004000u,
+                                         0x12344000u};
+  test.opcodes = {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
+                  O::V_MIN_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.dx10_clamp = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ComputeDx10ClampF32Nan(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7fc00000u); // qNaN
+  AppendVMovLiteral(&code, 1, 0x40000000u); // +2.0f
+  code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+  code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeDx10ClampF32NanEnabled"
+                      : "ComputeDx10ClampF32NanDisabled";
+  test.code = std::move(code);
+  test.expected = enabled ? std::vector<u32>{0x00000000u, 0x40000000u}
+                          : std::vector<u32>{0x40000000u, 0x40000000u};
+  test.opcodes = {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.dx10_clamp = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ComputeFp16RneConversion() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f803000u); // tie: 0x3c01/0x3c02
+  AppendVMovLiteral(&code, 1, 0x33c00000u); // tie: 0x0001/0x0002
+  AppendVMovLiteral(&code, 2, 0x33000000u); // tie: 0x0000/0x0001
+  AppendVMovLiteral(&code, 3, 0xb3c00000u); // negative subnormal tie
+  code.push_back(EncodeVop1(0x0a, 10, Vgpr(0)));
+  code.push_back(EncodeVop1(0x0a, 11, Vgpr(1)));
+  code.push_back(EncodeVop1(0x0a, 12, Vgpr(2)));
+  code.push_back(EncodeVop1(0x0a, 13, Vgpr(3)));
+
+  AppendVMovLiteral(&code, 4, 0x3c013c01u);
+  AppendVMovLiteral(&code, 5, 0x10001000u);
+  AppendVop3p(&code, 0x0f, 14, Vgpr(4), Vgpr(5), 0, 0x3);
+  for (u32 i = 0; i < 5; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ComputeFp16RneConversion";
+  test.code = std::move(code);
+  test.expected = {0x00003c02u, 0x00000002u, 0x00000000u,
+                   0x00008002u, 0x3c023c02u};
+  test.opcodes = {O::V_MOV_B32, O::V_CVT_F16_F32, O::V_PK_ADD_F16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.float_mode = 0xc0u;
+  test.has_compute_info = true;
+  test.forbidden_spirv = {"PackHalf2x16"};
+  return test;
+}
+
 TestCase VectorMinMaxF16Ops() {
   using O = ShaderOpcode;
 
@@ -14114,16 +15013,15 @@ TestCase VectorRemainingPackedOps() {
   return {"VectorRemainingPackedOps",
           code,
           {},
-          {0x000e0008u, 0x00080003u, 0x00060004u, 0xfffefffeu,
-           0x00100006u, 0x00040004u, 0xfffefffeu, 0x00040003u,
-           0xfff8fffcu, 0x000e0008u, 0x00060004u, 0xfffefffeu,
-           0xfff8fffcu, 0x00040003u, 0x4b004800u},
-          {O::V_MOV_B32, O::V_PK_MAD_I16, O::V_PK_MUL_LO_U16,
-           O::V_PK_ADD_I16, O::V_PK_SUB_I16, O::V_PK_LSHLREV_B16,
-           O::V_PK_LSHRREV_B16, O::V_PK_ASHRREV_I16, O::V_PK_MAX_I16,
-           O::V_PK_MIN_I16, O::V_PK_MAD_U16, O::V_PK_ADD_U16,
-           O::V_PK_SUB_U16, O::V_PK_MAX_U16, O::V_PK_MIN_U16,
-           O::V_PK_FMAC_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {0x000e0008u, 0x00080003u, 0x00060004u, 0xfffefffeu, 0x00100006u,
+           0x00040004u, 0xfffefffeu, 0x00040003u, 0xfff8fffcu, 0x000e0008u,
+           0x00060004u, 0xfffefffeu, 0xfff8fffcu, 0x00040003u, 0x4b004800u},
+          {O::V_MOV_B32, O::V_PK_MAD_I16, O::V_PK_MUL_LO_U16, O::V_PK_ADD_I16,
+           O::V_PK_SUB_I16, O::V_PK_LSHLREV_B16, O::V_PK_LSHRREV_B16,
+           O::V_PK_ASHRREV_I16, O::V_PK_MAX_I16, O::V_PK_MIN_I16,
+           O::V_PK_MAD_U16, O::V_PK_ADD_U16, O::V_PK_SUB_U16, O::V_PK_MAX_U16,
+           O::V_PK_MIN_U16, O::V_PK_FMAC_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorRemainingF16Ops() {
@@ -14167,14 +15065,13 @@ TestCase VectorRemainingF16Ops() {
   return {"VectorRemainingF16Ops",
           code,
           {},
-          {0x00004200u, 0x0000c000u, 3u, 0x00003e00u, 0x00004000u,
-           0x00004200u, 0x00004000u, 0x00004000u, 0x00004700u,
-           0x00004700u, 0x00004200u, 0x42004000u},
-          {O::V_MOV_B32, O::V_CVT_F16_U16, O::V_CVT_F16_I16,
-           O::V_CVT_I16_F16, O::V_SQRT_F16, O::V_FLOOR_F16, O::V_CEIL_F16,
-           O::V_TRUNC_F16, O::V_RNDNE_F16, O::V_FMAC_F16, O::V_FMAMK_F16,
-           O::V_FMAAK_F16, O::V_PACK_B32_F16, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {0x00004200u, 0x0000c000u, 3u, 0x00003e00u, 0x00004000u, 0x00004200u,
+           0x00004000u, 0x00004000u, 0x00004700u, 0x00004700u, 0x00004200u,
+           0x42004000u},
+          {O::V_MOV_B32, O::V_CVT_F16_U16, O::V_CVT_F16_I16, O::V_CVT_I16_F16,
+           O::V_SQRT_F16, O::V_FLOOR_F16, O::V_CEIL_F16, O::V_TRUNC_F16,
+           O::V_RNDNE_F16, O::V_FMAC_F16, O::V_FMAMK_F16, O::V_FMAAK_F16,
+           O::V_PACK_B32_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorWritelaneIgnoresExecMask() {
@@ -14469,9 +15366,8 @@ int KYTY_SYSV_ABI TestRudpEventHandler(int, int, const uint8_t *, size_t,
 void CheckSystemLibraryStateContracts() {
   EnsureConfigInitialized();
 
-  const auto report_path =
-      std::filesystem::temp_directory_path() /
-      "kyty_unresolved_import_report_test.json";
+  const auto report_path = std::filesystem::temp_directory_path() /
+                           "kyty_unresolved_import_report_test.json";
   const std::vector<Loader::UnresolvedImportReportEntry> report_entries = {
       {"/app0/eboot.bin", "BBBBBBBBBBB", "BBBBBBBBBBB[Lib][Module][Func]",
        "Func", "Global", 1},
@@ -14482,21 +15378,21 @@ void CheckSystemLibraryStateContracts() {
   const bool report_written =
       Loader::WriteUnresolvedImportReportFile(report_path, report_entries);
   std::ifstream report_file(report_path, std::ios::binary);
-  const auto report_json =
-      nlohmann::json::parse(report_file, nullptr, false);
+  const auto report_json = nlohmann::json::parse(report_file, nullptr, false);
   report_file.close();
   std::error_code remove_report_error;
   std::filesystem::remove(report_path, remove_report_error);
-  Require("SystemLibraryState", "Unresolved import JSON report",
-          report_written && report_json.is_object() &&
-              report_json.value("schema_version", 0) == 1 &&
-              report_json.value("unique_imports", 0) == 2 &&
-              report_json.value("relocation_sites", 0) == 3 &&
-              report_json["imports"].is_array() &&
-              report_json["imports"].size() == 2 &&
-              report_json["imports"][0].value("nid", "") == "AAAAAAAAAAA" &&
-              report_json["imports"][0].value("relocation_sites", 0) == 2,
-          "unresolved imports were not grouped and serialized deterministically");
+  Require(
+      "SystemLibraryState", "Unresolved import JSON report",
+      report_written && report_json.is_object() &&
+          report_json.value("schema_version", 0) == 1 &&
+          report_json.value("unique_imports", 0) == 2 &&
+          report_json.value("relocation_sites", 0) == 3 &&
+          report_json["imports"].is_array() &&
+          report_json["imports"].size() == 2 &&
+          report_json["imports"][0].value("nid", "") == "AAAAAAAAAAA" &&
+          report_json["imports"][0].value("relocation_sites", 0) == 2,
+      "unresolved imports were not grouped and serialized deterministically");
 
   Loader::SymbolDatabase symbols;
   ::Libs::InitAll(&symbols);
@@ -15503,7 +16399,7 @@ void CheckSystemLibraryStateContracts() {
   std::array<uint8_t, 8> ajm_init_result{};
   const std::array<int16_t, 4> lpcm_input = {32767, -32768, 16384, -16384};
   std::array<float, 4> lpcm_output{};
-  std::array<uint8_t, 24> ajm_decode_result{};
+  std::array<uint8_t, 32> ajm_decode_result{};
   const uint64_t lpcm_flags = 2u | (2u << 7u);
   Require(
       "SystemLibraryState", "AJM LPCM decoder",
@@ -15528,6 +16424,44 @@ void CheckSystemLibraryStateContracts() {
           ajm_finalize(ajm_context) == OK,
       "AJM LPCM initialization or sample conversion failed");
 
+  uint32_t atrac9_context = 0;
+  uint32_t atrac9_instance = 0;
+  std::array<uint8_t, 512> atrac9_commands{};
+  AjmBatchInfoAbi atrac9_batch{};
+  std::array<uint8_t, 100> atrac9_streaming_header{};
+  std::copy_n(atrac9_wave.begin(), atrac9_streaming_header.size(),
+              atrac9_streaming_header.begin());
+  constexpr uint32_t atrac9_streaming_data_size = 0x00010000;
+  for (uint32_t i = 0; i < 4; i++) {
+    atrac9_streaming_header[96 + i] =
+        static_cast<uint8_t>(atrac9_streaming_data_size >> (i * 8u));
+  }
+  std::array<uint8_t, 32> atrac9_decode_result{};
+  const uint64_t atrac9_flags = 2u | (1ull << 32u);
+  const int atrac9_step_initialize = ajm_initialize(0, &atrac9_context);
+  const int atrac9_step_register = ajm_module_register(atrac9_context, 1, 0);
+  const int atrac9_step_create =
+      ajm_instance_create(atrac9_context, 1, atrac9_flags, &atrac9_instance);
+  const int atrac9_step_batch = ajm_batch_initialize(
+      atrac9_commands.data(), atrac9_commands.size(), &atrac9_batch);
+  const int atrac9_step_decode = ajm_job_decode(
+      &atrac9_batch, atrac9_instance, atrac9_streaming_header.data(),
+      atrac9_streaming_header.size(), nullptr, 0, atrac9_decode_result.data());
+  const auto atrac9_result =
+      *reinterpret_cast<const int32_t *>(atrac9_decode_result.data());
+  const auto atrac9_consumed =
+      *reinterpret_cast<const int32_t *>(atrac9_decode_result.data() + 8);
+  Require("SystemLibraryState", "AJM ATRAC9 streaming RIFF header",
+          atrac9_step_initialize == OK && atrac9_step_register == OK &&
+              atrac9_step_create == OK && atrac9_step_batch == OK &&
+              atrac9_step_decode == OK && atrac9_result == 0x08 &&
+              atrac9_consumed ==
+                  static_cast<int32_t>(atrac9_streaming_header.size()) &&
+              ajm_instance_destroy(atrac9_context, atrac9_instance) == OK &&
+              ajm_module_unregister(atrac9_context, 1) == OK &&
+              ajm_finalize(atrac9_context) == OK,
+          "AJM ATRAC9 rejected a valid streaming RIFF data chunk header");
+
   struct AjmHevagParamsAbi {
     uint32_t sample_rate;
     uint32_t channels;
@@ -15542,7 +16476,7 @@ void CheckSystemLibraryStateContracts() {
   hevag_input[0] = 0x0c;
   std::fill(hevag_input.begin() + 2, hevag_input.end(), 0x77);
   std::array<float, 28> hevag_output{};
-  std::array<uint8_t, 24> hevag_decode_result{};
+  std::array<uint8_t, 32> hevag_decode_result{};
   const uint64_t hevag_flags = 1u | (2u << 7u);
   const int hevag_step_init = ajm_initialize(0, &hevag_context);
   const int hevag_step_register = ajm_module_register(hevag_context, 22, 0);
@@ -15728,8 +16662,8 @@ void CheckSystemLibraryStateContracts() {
   using CesProfileRefFn = const uint8_t *(KYTY_SYSV_ABI *)();
   using CesUtf8ToSbcFn = int(KYTY_SYSV_ABI *)(
       const uint8_t *, uint32_t, uint32_t *, const uint8_t *, uint8_t *);
-  using CesSbcToUtf8Fn = int(KYTY_SYSV_ABI *)(
-      const uint8_t *, uint8_t, uint8_t *, uint32_t, uint32_t *);
+  using CesSbcToUtf8Fn = int(KYTY_SYSV_ABI *)(const uint8_t *, uint8_t,
+                                              uint8_t *, uint32_t, uint32_t *);
   const auto ces_profile_init =
       reinterpret_cast<CesProfileInitFn>(find("ZiDCxUUGbec"));
   const auto ces_context_init =
@@ -15783,49 +16717,217 @@ void CheckSystemLibraryStateContracts() {
   using UserListFn = int(KYTY_SYSV_ABI *)(UserLoginListAbi *);
   using UserEventFn = int(KYTY_SYSV_ABI *)(UserEventAbi *);
   using UserNameFn = int(KYTY_SYSV_ABI *)(int, char *, size_t);
-  using PrivacyFn = int(KYTY_SYSV_ABI *)(uint64_t, uint64_t, uint64_t,
-                                         uint64_t, uint64_t, uint64_t);
+  using UserNumberFn = int(KYTY_SYSV_ABI *)(int, int32_t *);
+  using PadInitFn = int(KYTY_SYSV_ABI *)();
+  using PadOpenFn = int(KYTY_SYSV_ABI *)(int, int, int, const void *);
+  using PadGetHandleFn = int(KYTY_SYSV_ABI *)(int, int, int);
+  using PadReadStateFn = int(KYTY_SYSV_ABI *)(int, Libs::Controller::PadData *);
+  using PadCloseFn = int(KYTY_SYSV_ABI *)(int);
+  using PrivacyFn = int(KYTY_SYSV_ABI *)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t);
   const auto user_initialize =
       reinterpret_cast<UserInitializeFn>(find("j3YMu1MVNNo"));
   const auto user_initial = reinterpret_cast<UserIdFn>(find("CdWp0oHWGr0"));
   const auto user_list = reinterpret_cast<UserListFn>(find("fPhymKNvK-A"));
   const auto user_event = reinterpret_cast<UserEventFn>(find("yH17Q6NWtVg"));
   const auto user_name = reinterpret_cast<UserNameFn>(find("1xxcMiGu2fo"));
+  const auto user_number = reinterpret_cast<UserNumberFn>(find("bwFjS+bX9mA"));
+  const auto pad_init = reinterpret_cast<PadInitFn>(find("hv1luiJrqQM"));
+  const auto pad_open = reinterpret_cast<PadOpenFn>(find("xk0AcarP3V4"));
+  const auto pad_get_handle =
+      reinterpret_cast<PadGetHandleFn>(find("u1GRHp+oWoY"));
+  const auto pad_read_state =
+      reinterpret_cast<PadReadStateFn>(find("YndgXqQVV7c"));
+  const auto pad_close = reinterpret_cast<PadCloseFn>(find("6ncge5+l5Qs"));
   const auto privacy = reinterpret_cast<PrivacyFn>(find("D-CzAxQL0XI"));
   Config::ConfigOptions user_config;
   user_config.printf_direction = Config::OutputDirection::Silent;
   user_config.user_id = 4242;
   user_config.user_name = "GodsWill";
+  user_config.local_player_count = Config::MAX_LOCAL_USERS;
+  constexpr std::array<const char *, Config::MAX_LOCAL_USERS> controller_guids =
+      {"01000000000000000000000000000001", "01000000000000000000000000000002",
+       "01000000000000000000000000000003", "01000000000000000000000000000004"};
+  for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+    user_config.controller_guids[i] = controller_guids[i];
+  }
   Config::Load(user_config);
   int initial_user = -1;
+  int player_number = 0;
   UserLoginListAbi login_list{};
-  UserEventAbi login_event{};
+  UserEventAbi user_event_data{};
   std::array<char, 16> configured_user_name{};
   std::array<char, 4> short_user_name{};
+  const bool user_initialized = user_initialize(nullptr) == OK;
+  const bool initial_login_event =
+      user_initialized && user_event(&user_event_data) == OK &&
+      user_event_data.event_type == 0 && user_event_data.user_id == 4242 &&
+      user_event(&user_event_data) ==
+          Libs::UserService::USER_SERVICE_ERROR_NO_EVENT;
+  Require("SystemLibraryState", "Configurable initial UserService",
+          user_initialized &&
+              user_initial(nullptr) ==
+                  Libs::UserService::USER_SERVICE_ERROR_INVALID_ARGUMENT &&
+              user_initial(&initial_user) == OK && initial_user == 4242 &&
+              user_list(&login_list) == OK && login_list.user_id[0] == 4242 &&
+              login_list.user_id[1] == -1 && login_list.user_id[2] == -1 &&
+              login_list.user_id[3] == -1 && initial_login_event &&
+              user_name(4242, configured_user_name.data(),
+                        configured_user_name.size()) == OK &&
+              std::string_view(configured_user_name.data()) == "GodsWill" &&
+              user_name(4242, short_user_name.data(), short_user_name.size()) ==
+                  Libs::UserService::USER_SERVICE_ERROR_BUFFER_TOO_SHORT &&
+              user_name(4245, configured_user_name.data(),
+                        configured_user_name.size()) ==
+                  Libs::UserService::USER_SERVICE_ERROR_NOT_LOGGED_IN &&
+              user_name(1000, configured_user_name.data(),
+                        configured_user_name.size()) ==
+                  Libs::UserService::USER_SERVICE_ERROR_NOT_LOGGED_IN,
+          "UserService did not expose only the connected configured users");
+
+  constexpr int PAD_ERROR_INVALID_ARG = -2137915391;
+  constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389;
+  constexpr int PAD_ERROR_ALREADY_OPENED = -2137915388;
+  constexpr int PAD_ERROR_NO_HANDLE = -2137915384;
+  constexpr std::array<int, Config::MAX_LOCAL_USERS> controller_ids = {
+      7000, 7001, 7002, 7003};
+  constexpr std::array<uint32_t, Config::MAX_LOCAL_USERS> player_buttons = {
+      Libs::Controller::PAD_BUTTON_CROSS, Libs::Controller::PAD_BUTTON_CIRCLE,
+      Libs::Controller::PAD_BUTTON_SQUARE,
+      Libs::Controller::PAD_BUTTON_TRIANGLE};
+  constexpr std::array<uint32_t, Config::MAX_LOCAL_USERS> connection_order = {
+      3, 1, 0, 2};
+  bool guid_assignment_and_events_ok = true;
+  for (const uint32_t player : connection_order) {
+    Libs::Controller::ControllerConnect(controller_ids[player],
+                                        controller_guids[player]);
+    Libs::Controller::ControllerButton(controller_ids[player],
+                                       player_buttons[player], true);
+    const int event_result = user_event(&user_event_data);
+    if (player == 0) {
+      guid_assignment_and_events_ok =
+          guid_assignment_and_events_ok &&
+          event_result == Libs::UserService::USER_SERVICE_ERROR_NO_EVENT;
+    } else {
+      guid_assignment_and_events_ok =
+          guid_assignment_and_events_ok && event_result == OK &&
+          user_event_data.event_type == 0 &&
+          user_event_data.user_id == 4242 + static_cast<int>(player);
+    }
+  }
   Require(
-      "SystemLibraryState", "Configurable UserService",
-      user_initialize(nullptr) == OK &&
-          user_initial(nullptr) ==
-              Libs::UserService::USER_SERVICE_ERROR_INVALID_ARGUMENT &&
-          user_initial(&initial_user) == OK && initial_user == 4242 &&
-          user_list(&login_list) == OK && login_list.user_id[0] == 4242 &&
-          login_list.user_id[1] == -1 && user_event(&login_event) == OK &&
-          login_event.event_type == 0 && login_event.user_id == 4242 &&
-          user_event(&login_event) ==
-              Libs::UserService::USER_SERVICE_ERROR_NO_EVENT &&
-          user_name(4242, configured_user_name.data(),
+      "SystemLibraryState", "Persistent GUID player assignment",
+      guid_assignment_and_events_ok && user_list(&login_list) == OK &&
+          login_list.user_id[0] == 4242 && login_list.user_id[1] == 4243 &&
+          login_list.user_id[2] == 4244 && login_list.user_id[3] == 4245 &&
+          user_name(4245, configured_user_name.data(),
                     configured_user_name.size()) == OK &&
-          std::string_view(configured_user_name.data()) == "GodsWill" &&
-          user_name(4242, short_user_name.data(), short_user_name.size()) ==
-              Libs::UserService::USER_SERVICE_ERROR_BUFFER_TOO_SHORT &&
-          user_name(1000, configured_user_name.data(),
-                    configured_user_name.size()) ==
-              Libs::UserService::USER_SERVICE_ERROR_NOT_LOGGED_IN,
-      "UserService did not honor the configured local identity or error ABI");
+          user_number(4245, &player_number) == OK && player_number == 4,
+      "SDL GUID reservations or login events did not follow logical players");
+
+  std::array<int, Config::MAX_LOCAL_USERS> pad_handles{};
+  bool pad_handles_ok = pad_init() == OK;
+  for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+    pad_handles[i] = pad_open(4242 + static_cast<int>(i), 0, 0, nullptr);
+    pad_handles_ok =
+        pad_handles_ok && pad_handles[i] == static_cast<int>(i + 1) &&
+        pad_get_handle(4242 + static_cast<int>(i), 0, 0) == pad_handles[i];
+  }
+  const int special_handle = pad_open(4242, 2, 0, nullptr);
+  const int remote_handle = pad_open(0xff, 16, 0, nullptr);
+  std::array<Libs::Controller::PadData, Config::MAX_LOCAL_USERS> pad_states{};
+  bool isolated_input_ok = true;
+  for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+    isolated_input_ok = isolated_input_ok &&
+                        pad_read_state(pad_handles[i], &pad_states[i]) == OK &&
+                        pad_states[i].connected &&
+                        pad_states[i].buttons == player_buttons[i];
+  }
+  Require("SystemLibraryState", "Four independent local pads",
+          pad_handles_ok && isolated_input_ok &&
+              pad_open(4242, 0, 0, nullptr) == PAD_ERROR_ALREADY_OPENED &&
+              pad_open(4246, 0, 0, nullptr) == PAD_ERROR_INVALID_ARG,
+          "Pad handles or controller input were not isolated per local user");
+
+  Libs::Controller::PadData special_state{};
+  Require("SystemLibraryState", "Pad handles keyed by full port tuple",
+          special_handle == 5 && remote_handle == 6 &&
+              special_handle != pad_handles[0] &&
+              pad_get_handle(4242, 2, 0) == special_handle &&
+              pad_get_handle(0xff, 16, 0) == remote_handle &&
+              pad_get_handle(4243, 2, 0) == PAD_ERROR_NO_HANDLE &&
+              pad_open(4242, 2, 0, nullptr) == PAD_ERROR_ALREADY_OPENED &&
+              pad_close(pad_handles[0]) == OK &&
+              pad_get_handle(4242, 0, 0) == PAD_ERROR_NO_HANDLE &&
+              pad_read_state(special_handle, &special_state) == OK &&
+              special_state.buttons == player_buttons[0],
+          "PadOpen/GetHandle collided across user, type, or index");
+
+  Libs::Controller::ControllerDisconnect(controller_ids[1]);
+  const bool logout_ok =
+      user_event(&user_event_data) == OK && user_event_data.event_type == 1 &&
+      user_event_data.user_id == 4243 && user_list(&login_list) == OK &&
+      login_list.user_id[1] == -1 &&
+      user_name(4243, configured_user_name.data(),
+                configured_user_name.size()) ==
+          Libs::UserService::USER_SERVICE_ERROR_NOT_LOGGED_IN;
+  Libs::Controller::ControllerConnect(controller_ids[1], controller_guids[1]);
+  const bool relogin_ok = user_event(&user_event_data) == OK &&
+                          user_event_data.event_type == 0 &&
+                          user_event_data.user_id == 4243;
+  Require("SystemLibraryState", "Dynamic UserService events",
+          logout_ok && relogin_ok,
+          "Controller removal/reconnect did not emit logout/login events");
+
+  auto two_player_config = user_config;
+  two_player_config.local_player_count = 2;
+  Config::Load(two_player_config);
+  UserEventAbi player3_logout{};
+  UserEventAbi player4_logout{};
+  const bool player_limit_ok =
+      Config::GetLocalPlayerCount() == 2 &&
+      Config::GetLocalUserIndex(4244) < 0 &&
+      user_event(&player3_logout) == OK && player3_logout.event_type == 1 &&
+      player3_logout.user_id == 4244 && user_event(&player4_logout) == OK &&
+      player4_logout.event_type == 1 && player4_logout.user_id == 4245 &&
+      user_event(&user_event_data) ==
+          Libs::UserService::USER_SERVICE_ERROR_NO_EVENT &&
+      user_list(&login_list) == OK && login_list.user_id[0] == 4242 &&
+      login_list.user_id[1] == 4243 && login_list.user_id[2] == -1 &&
+      login_list.user_id[3] == -1 &&
+      pad_open(4244, 0, 0, nullptr) == PAD_ERROR_INVALID_ARG;
+  Require("SystemLibraryState", "One-to-four local player limit",
+          player_limit_ok,
+          "Configured player limit did not constrain UserService and Pad");
+
+  Config::Load(user_config);
+  bool restored_login_events = true;
+  for (int user_id : {4244, 4245}) {
+    restored_login_events =
+        restored_login_events && user_event(&user_event_data) == OK &&
+        user_event_data.event_type == 0 && user_event_data.user_id == user_id;
+  }
+
+  bool pad_close_ok = true;
+  for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+    Libs::Controller::ControllerDisconnect(controller_ids[i]);
+    if (i != 0) {
+      pad_close_ok = pad_close_ok && pad_close(pad_handles[i]) == OK &&
+                     pad_get_handle(4242 + static_cast<int>(i), 0, 0) ==
+                         PAD_ERROR_NO_HANDLE;
+    }
+  }
+  pad_close_ok = pad_close_ok && pad_close(special_handle) == OK &&
+                 pad_close(remote_handle) == OK;
+  Require("SystemLibraryState", "Four local pad lifecycles",
+          restored_login_events && pad_close_ok &&
+              pad_close(pad_handles[0]) == PAD_ERROR_INVALID_HANDLE,
+          "PadClose/GetHandle did not track each local user's handle");
   Require("SystemLibraryState", "Privacy unsupported state",
           privacy(0, 0, 0, 0, 0, 0) ==
               Libs::UserService::USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED,
-          "Privacy returned false success instead of an explicit unsupported result");
+          "Privacy returned false success instead of an explicit unsupported "
+          "result");
 
   Config::ConfigOptions default_config;
   default_config.printf_direction = Config::OutputDirection::Silent;
@@ -16863,19 +17965,20 @@ TestCase VectorRemainingB16Ops() {
   return {"VectorRemainingB16Ops",
           code,
           {},
-          {0x00000001u, 0x0000fffeu, 0x0000ffffu, 0x00000003u,
-           0x00000005u, 0x0000fffeu, 0x00008000u, 0x0000fffbu,
-           0x0000000cu, 0x00004000u, 0x0000ffffu,
-           1u, 0u, 1u, 0u, 1u, 0u, 1u, 0u, 1u, 0u, 1u, 0u},
-          {O::V_MOV_B32, O::V_ADD_NC_U16, O::V_SUB_NC_U16, O::V_MAX_U16,
-           O::V_MAX_I16, O::V_MIN_U16, O::V_MIN_I16, O::V_ADD_NC_I16,
-           O::V_SUB_NC_I16, O::V_LSHLREV_B16, O::V_LSHRREV_B16,
-           O::V_ASHRREV_I16, O::V_CMP_LT_I16, O::V_CMP_EQ_I16,
-           O::V_CMP_LE_I16, O::V_CMP_GT_I16, O::V_CMP_NE_I16,
-           O::V_CMP_GE_I16, O::V_CMP_LT_U16, O::V_CMP_EQ_U16,
-           O::V_CMP_LE_U16, O::V_CMP_GT_U16, O::V_CMP_NE_U16,
-           O::V_CMP_GE_U16, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {0x00000001u, 0x0000fffeu, 0x0000ffffu, 0x00000003u, 0x00000005u,
+           0x0000fffeu, 0x00008000u, 0x0000fffbu, 0x0000000cu, 0x00004000u,
+           0x0000ffffu, 1u,          0u,          1u,          0u,
+           1u,          0u,          1u,          0u,          1u,
+           0u,          1u,          0u},
+          {O::V_MOV_B32,     O::V_ADD_NC_U16,       O::V_SUB_NC_U16,
+           O::V_MAX_U16,     O::V_MAX_I16,          O::V_MIN_U16,
+           O::V_MIN_I16,     O::V_ADD_NC_I16,       O::V_SUB_NC_I16,
+           O::V_LSHLREV_B16, O::V_LSHRREV_B16,      O::V_ASHRREV_I16,
+           O::V_CMP_LT_I16,  O::V_CMP_EQ_I16,       O::V_CMP_LE_I16,
+           O::V_CMP_GT_I16,  O::V_CMP_NE_I16,       O::V_CMP_GE_I16,
+           O::V_CMP_LT_U16,  O::V_CMP_EQ_U16,       O::V_CMP_LE_U16,
+           O::V_CMP_GT_U16,  O::V_CMP_NE_U16,       O::V_CMP_GE_U16,
+           O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaCndmaskSourceModifier() {
@@ -19192,6 +20295,34 @@ TestCase DsReadU16D16CapturedPreservesHighHalf() {
   return test;
 }
 
+TestCase DsReadU16D16HiCapturedPreservesLowHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x89abcdefu);
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 2, 1)); // ds_write_b32 v2, v1
+
+  AppendVMovLiteral(&code, 5, 0x12345678u);
+  AppendVMovU32(&code, 6, 0);
+  code.push_back(0xda9c0000u);
+  code.push_back(0x05000006u); // captured ds_read_u16_d16_hi v5, v6
+
+  AppendStoreVgpr(&code, 5, 0);
+  AppendEnd(&code);
+
+  TestCase test{"DsReadU16D16HiCapturedPreservesLowHalf",
+                code,
+                std::vector<u32>(1, 0),
+                {0xcdef5678u},
+                {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_U16_D16_HI,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_READ_U16_D16_HI", 1}};
+  test.native_ir_counts = {{"DsReadUshort", 1}};
+  return test;
+}
+
 TestCase DsReadWrite2Variants() {
   using O = ShaderOpcode;
 
@@ -19674,6 +20805,42 @@ TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
       {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase BufferAtomicCompareSwapExactRaw() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 4, 0);
+  AppendVMovU32(&code, 1, 99); // replacement
+  AppendVMovU32(&code, 2, 10); // comparator
+  code.push_back(0xe0c46000u);
+  code.push_back(
+      0x80080104u); // buffer_atomic_cmpswap v[1:2], v4, s[32:35] idxen glc
+  AppendStoreVgpr(&code, 1, 2);
+
+  AppendVMovU32(&code, 4, 1);
+  AppendVMovU32(&code, 1, 77); // replacement
+  AppendVMovU32(&code, 2, 30); // comparator; does not match memory[1]
+  code.push_back(EncodeMubuf0(0x31u, 0, true, false, true));
+  code.push_back(EncodeMubuf1(1, 8, 4));
+  AppendStoreVgpr(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferAtomicCompareSwapExactRaw";
+  test.code = std::move(code);
+  test.initial = {10, 20, 0, 0};
+  test.expected = {99, 20, 10, 20};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_CMPSWAP, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  const auto descriptor = MakeStructuredStorageBufferData(
+      sizeof(u32), static_cast<u32>(test.initial.size()));
+  std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 32);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpAtomicCompareExchange"};
+  return test;
+}
+
 TestCase BufferAtomicFMinExactRawGlcModes() {
   using O = ShaderOpcode;
 
@@ -20058,6 +21225,63 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadR16SintSignExtends() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadR16SintSignExtends";
+  test.code = std::move(code);
+  test.expected = {0xffff8001u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[3] = 0x00008001u;
+  test.sampled_image_format = vk::Format::eR16Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k16SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+                         "OpImageFetch %v4uint", "OpBitFieldSExtract"};
+  return test;
+}
+
+TestCase ImageLoadRg8SintSignExtends() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x3));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadRg8SintSignExtends";
+  test.code = std::move(code);
+  test.expected = {0xffffffffu, 0xffffff80u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[3] = 0x000080ffu;
+  test.sampled_image_format = vk::Format::eR16Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8_8SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+                         "OpImageFetch %v4uint", "OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   using O = ShaderOpcode;
 
@@ -20415,8 +21639,8 @@ TestCase ImageSampleAndGather() {
   auto image = MakeRgbaImage(4, 4);
   for (u32 y = 0; y < 4u; y++) {
     for (u32 x = 0; x < 4u; x++) {
-      SetRgbaPixel(&image, 4, x, y, 0x3f800000u, 0x40000000u,
-                   0x40400000u, 0x40800000u);
+      SetRgbaPixel(&image, 4, x, y, 0x3f800000u, 0x40000000u, 0x40400000u,
+                   0x40800000u);
     }
   }
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
@@ -20425,27 +21649,15 @@ TestCase ImageSampleAndGather() {
   TestCase test;
   test.name = "ImageSampleAndGather";
   test.code = code;
-  test.expected = {0x3f800000u,
-                   0x40000000u,
-                   0x40400000u,
-                   0x40800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0x3f800000u,
-                   0,
-                   0x40000000u,
-                   0x40000000u,
-                   0x40000000u,
+  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+                   0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u,
+                   0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u,
+                   0,           0x40000000u, 0x40000000u, 0x40000000u,
                    0x40000000u};
-  test.opcodes = {
-      O::V_MOV_B32,        O::IMAGE_SAMPLE,       O::IMAGE_GET_LOD,
-      O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
-      O::IMAGE_GATHER4H,   O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::IMAGE_SAMPLE,
+                  O::IMAGE_GET_LOD,      O::IMAGE_GATHER4_LZ,
+                  O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
+                  O::IMAGE_GATHER4H,     O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"gather_horizontal", 1}};
   test.required_spirv = {"OpImageGather"};
@@ -20776,6 +21988,11 @@ void CheckIndirectImageKeySwitch() {
   root.indirect_mapping_capacity = mapping_capacity;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
+  candidate.kind = ResourceKind::ImageUint;
+  candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  candidate.conversion_format = Prospero::BufferFormat::k8_8SInt;
+  candidate.shader_swizzle = DstSel(5, 4, 1, 0);
+  candidate.cube = true;
   candidate.indirect_mapping_capacity = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
@@ -20783,7 +22000,12 @@ void CheckIndirectImageKeySwitch() {
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
   std::string error;
-  Require(name, "binding layout", AllocateBindings(program, 0, &error),
+  Require(name, "binding layout",
+          AllocateBindings(program, 0, &error) &&
+              FindBinding(program.bindings, DescriptorBindingKind::Sampled2D) !=
+                  nullptr &&
+              FindBinding(program.bindings,
+                          DescriptorBindingKind::SampledUint2DArray) != nullptr,
           error.c_str());
   ResourceSnapshot snapshot{};
   DescriptorValue descriptor{};
@@ -20797,6 +22019,11 @@ void CheckIndirectImageKeySwitch() {
       (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
   snapshot.images = {descriptor, descriptor};
   snapshot.images[1].dwords[0] = 0x40u;
+  snapshot.images[1].dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k8_8SInt) << 20u;
+  snapshot.images[1].dwords[3] =
+      candidate.shader_swizzle |
+      (static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u);
   snapshot.flattened_srt.resize(1u + mapping_capacity * 2u);
   snapshot.flattened_srt[0] = 2u;
   snapshot.flattened_srt[1] = 0u;
@@ -20806,6 +22033,7 @@ void CheckIndirectImageKeySwitch() {
   DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   snapshot.samplers.push_back(sampler_descriptor);
+  program.values->memory_info[0].point_sampler = 0;
 
   ShaderComputeInputInfo compute{};
   std::vector<u32> spirv;
@@ -20825,8 +22053,10 @@ void CheckIndirectImageKeySwitch() {
           text.find("OpSwitch") != std::string::npos &&
               text.find("OpPhi") != std::string::npos &&
               CountText(text, "OpImageSampleExplicitLod") == 2 &&
+              text.find("OpBitFieldSExtract") != std::string::npos &&
               CountText(text, "OpIEqual") == 11,
-          "dynamic image key did not use a compact two-sample switch");
+          "mixed float-2D/converted-sint-cube image key did not use a compact "
+          "two-sample switch");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -21241,11 +22471,10 @@ TestCase ImageAtomicVariants() {
   test.name = "ImageAtomicVariants";
   test.code = code;
   test.expected = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu, 10};
-  test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD,
-                  O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
-                  O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
-                  O::IMAGE_ATOMIC_UMAX,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {
+      O::V_MOV_B32,         O::IMAGE_ATOMIC_ADD,   O::IMAGE_ATOMIC_UMIN,
+      O::IMAGE_ATOMIC_AND,  O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
+      O::IMAGE_ATOMIC_UMAX, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpImageTexelPointer", "R32ui", "storage_atomic_2d"};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
                           "StorageImageReadWithoutFormat",
@@ -21615,6 +22844,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
+  AddCase(Vop1SdwaFfblCapturedHighWordSource);
+  AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
@@ -21630,6 +22861,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorAlignByteUsesFiveBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
+  AddCase(VectorMbcntWave64UsesLogicalLaneId);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
   AddCase(VectorSubrevCoCiU32ExactRawOnGpu);
@@ -21644,6 +22876,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
+  cases.push_back(ComputeFp16OverflowMode(false));
+  cases.push_back(ComputeFp16OverflowMode(true));
+  cases.push_back(ComputeDx10ClampF16Nan(false));
+  cases.push_back(ComputeDx10ClampF16Nan(true));
+  cases.push_back(ComputeDx10ClampF32Nan(false));
+  cases.push_back(ComputeDx10ClampF32Nan(true));
+  cases.push_back(ComputeFp16RneConversion());
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(VectorMinMaxMed3F16Ops);
@@ -21776,6 +23015,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatStoreVariants);
   AddCase(DsReadWriteVariants);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
+  AddCase(DsReadU16D16HiCapturedPreservesLowHalf);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);
@@ -21792,6 +23032,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
+  AddCase(BufferAtomicCompareSwapExactRaw);
   AddCase(BufferAtomicFMinExactRawGlcModes);
   AddCase(BufferAtomicFMinSpecialValues);
   AddCase(BufferAtomicFMinContendedWorkgroup);
@@ -21800,6 +23041,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadR16SintSignExtends);
+  AddCase(ImageLoadRg8SintSignExtends);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
@@ -22058,6 +23301,18 @@ void CheckEmbeddedFetchVertexOffset() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
+void CheckGeControlGroupSizeRange() {
+  Require("GeControlGroupSizeRange", "SDK 10 nine-bit range",
+          IsGeControlGroupSizeValid(0x0040u, 0x0040u) &&
+              IsGeControlGroupSizeValid(0x0100u, 0x0100u) &&
+              IsGeControlGroupSizeValid(0x01ffu, 0x01ffu) &&
+              !IsGeControlGroupSizeValid(0x0200u, 0x0040u) &&
+              !IsGeControlGroupSizeValid(0x0040u, 0x0200u),
+          "GE_CNTL group sizes were limited to a wave instead of their encoded "
+          "range");
+  std::printf("[host]    %-32s ok\n", "GeControlGroupSizeRange");
+}
+
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
   (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
@@ -22075,6 +23330,15 @@ void CheckRenderTargetFormatContract() {
               r8_uint.bytes_per_element == 1u &&
               r8_uint.export_mapping.IsIdentity(),
           "R8 uint render-target tuple was rejected");
+  Require("RenderTargetFormat", "combined write mask",
+          TextureGetRenderTargetWriteMask(Prospero::ColorMappingRgba, 0xfu,
+                                          0x1u) == 0x1u &&
+              TextureGetRenderTargetWriteMask(Prospero::ColorMappingRgba, 0x5u,
+                                              0x3u) == 0x1u &&
+              TextureGetRenderTargetWriteMask(Prospero::ColorMappingAbgr, 0xfu,
+                                              0x3u) == 0xcu,
+          "CB_TARGET_MASK and CB_SHADER_MASK were not combined before channel "
+          "mapping");
 
   const auto rgb565 = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
@@ -24049,6 +25313,38 @@ void CheckImageSpecializationId() {
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
 
+void CheckComputeFpStateSpecializationId() {
+  std::array<u32, 1> code{0xbf810000u};
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+
+  ShaderComputeInputInfo base{};
+  auto float_mode = base;
+  auto dx10 = base;
+  auto ieee = base;
+  auto fp16_overflow = base;
+  float_mode.float_mode = 0xc0u;
+  dx10.dx10_clamp = true;
+  ieee.ieee_mode = true;
+  fp16_overflow.fp16_overflow = true;
+
+  const auto base_id = ShaderGetIdCS(regs, base, false);
+  const auto float_mode_id = ShaderGetIdCS(regs, float_mode, false);
+  const auto dx10_id = ShaderGetIdCS(regs, dx10, false);
+  const auto ieee_id = ShaderGetIdCS(regs, ieee, false);
+  const auto fp16_overflow_id =
+      ShaderGetIdCS(regs, fp16_overflow, false);
+  Require("ComputeFpStateSpecializationId", "pipeline cache key",
+          base_id != float_mode_id && base_id != dx10_id &&
+              base_id != ieee_id && base_id != fp16_overflow_id &&
+              base_id.ids.size() == float_mode_id.ids.size() &&
+              base_id.ids.size() == dx10_id.ids.size() &&
+              base_id.ids.size() == ieee_id.ids.size() &&
+              base_id.ids.size() == fp16_overflow_id.ids.size(),
+          "compute FP control variants share a shader ID");
+  std::printf("[host]    %-32s ok\n", "ComputeFpStateSpecializationId");
+}
+
 void CheckStorageTextureVolumeUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
   constexpr uint32_t width = 33;
@@ -24312,6 +25608,30 @@ void CheckNativeMsaaState() {
   std::printf("[host]    %-32s ok\n", "NativeMsaaState");
 }
 
+void CheckRenderTargetViewRanges() {
+  constexpr auto array_view = ResolveTargetViewInfo(2, 5);
+  constexpr auto volume_view = ResolveVolumeTargetViewInfo(0, 64, 64);
+  constexpr auto volume_subview = ResolveVolumeTargetViewInfo(5, 70, 64);
+  constexpr auto invalid_volume = ResolveVolumeTargetViewInfo(64, 64, 64);
+
+  Require("RenderTargetViewRanges", "2D array inclusive range",
+          array_view.type == TargetViewType::Image2DArray &&
+              array_view.base_layer == 2 && array_view.layer_count == 4 &&
+              array_view.image_layers == 6,
+          "2D array view semantics changed");
+  Require("RenderTargetViewRanges", "3D mip-depth clamp",
+          volume_view.type == TargetViewType::Image2DArray &&
+              volume_view.base_layer == 0 && volume_view.layer_count == 64,
+          "3D slice maximum was not clamped to mip depth");
+  Require("RenderTargetViewRanges", "3D subrange clamp",
+          volume_subview.base_layer == 5 && volume_subview.layer_count == 59,
+          "3D subrange did not preserve its base slice");
+  Require("RenderTargetViewRanges", "3D invalid base",
+          invalid_volume.type == TargetViewType::Unsupported,
+          "3D view admitted a base slice outside the mip depth");
+  std::printf("[host]    %-32s ok\n", "RenderTargetViewRanges");
+}
+
 void CheckDepthHtileStencilCompatibility() {
   Require("DepthHtileStencilCompatibility", "disabled acceleration",
           depth_htile_stencil_acceleration_compatible(false, false, true),
@@ -24468,7 +25788,6 @@ void CheckDynamicRenderingState() {
   changed.color_attachments[0].image_layout = vk::ImageLayout::eGeneral;
   Require("DynamicRenderingState", "layout identity", first != changed,
           "attachment layout did not participate in rendering identity");
-
   PipelineRenderingState rgba{};
   rgba.color_count = 1;
   rgba.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
@@ -24950,15 +26269,19 @@ void CheckPm4IndirectRegisterPackets(RenderContext &renderer) {
   };
 
   alignas(8) const std::array<uint32_t, 6> context_registers{
-      0x10000000u | Pm4::CB_BLEND_RED, std::bit_cast<uint32_t>(1.25f),
-      Pm4::CB_BLEND_GREEN, std::bit_cast<uint32_t>(2.5f), 0xffffffffu, 0u};
+      0x10000000u | Pm4::CB_BLEND_RED,
+      std::bit_cast<uint32_t>(1.25f),
+      Pm4::CB_BLEND_GREEN,
+      std::bit_cast<uint32_t>(2.5f),
+      0xffffffffu,
+      0u};
   const bool context_ok =
       execute(Pm4::IT_SET_CONTEXT_REG_INDIRECT, context_registers.data(), 3u);
   const auto &blend = processor.GetCtx().GetBlendColor();
 
   alignas(8) const std::array<uint32_t, 4> shader_registers{
-      0x20000000u | Pm4::SPI_SHADER_USER_DATA_PS_0, 0xdeadbeefu,
-      Pm4::SH_NOP, 0u};
+      0x20000000u | Pm4::SPI_SHADER_USER_DATA_PS_0, 0xdeadbeefu, Pm4::SH_NOP,
+      0u};
   const bool shader_ok =
       execute(Pm4::IT_SET_SH_REG_INDIRECT, shader_registers.data(), 2u);
 
@@ -24966,8 +26289,8 @@ void CheckPm4IndirectRegisterPackets(RenderContext &renderer) {
   alignas(8) const std::array<uint32_t, 2> uconfig_registers{
       0x30000000u | Pm4::VGT_PRIMITIVE_TYPE,
       static_cast<uint32_t>(primitive_type)};
-  const bool uconfig_ok = execute(Pm4::IT_SET_UCONFIG_REG_INDIRECT,
-                                  uconfig_registers.data(), 1u);
+  const bool uconfig_ok =
+      execute(Pm4::IT_SET_UCONFIG_REG_INDIRECT, uconfig_registers.data(), 1u);
 
   Require(
       "Pm4IndirectRegisterPackets", "dynamic register streams",
@@ -25738,6 +27061,11 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuCommandLane();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-lane-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMbcntWave64UsesLogicalLaneId());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
@@ -25832,6 +27160,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--byte-geometry-alias-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckByteGeometryAlias();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -25847,6 +27180,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
     CheckStandard64RenderTargetTileRoundTrip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--target-view-only") == 0) {
+    CheckRenderTargetViewRanges();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--standard4-rt-only") == 0) {
@@ -25882,6 +27219,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSpecializationId();
     CheckIndirectImageKeySwitch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fp-state-only") == 0) {
+    CheckComputeFpStateSpecializationId();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ComputeFp16OverflowMode(false));
+    RunCase(&vulkan, ComputeFp16OverflowMode(true));
+    RunCase(&vulkan, ComputeDx10ClampF16Nan(false));
+    RunCase(&vulkan, ComputeDx10ClampF16Nan(true));
+    RunCase(&vulkan, ComputeDx10ClampF32Nan(false));
+    RunCase(&vulkan, ComputeDx10ClampF32Nan(true));
+    RunCase(&vulkan, ComputeFp16RneConversion());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
@@ -25928,6 +27277,8 @@ int main(int argc, char **argv) {
   CheckStorageTextureVolumeMipRegions();
   CheckStorageTextureGpuOwnedRebindState();
   CheckNativeMsaaState();
+  CheckComputeFpStateSpecializationId();
+  CheckRenderTargetViewRanges();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
   CheckStencilAttachmentAccess();
@@ -25961,6 +27312,7 @@ int main(int argc, char **argv) {
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
+  CheckGeControlGroupSizeRange();
   CheckEmbeddedFetchLaneSpill();
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
@@ -25978,6 +27330,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckByteGeometryAlias();
   vulkan.CheckBgra16Readback();
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif

@@ -341,6 +341,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	RebindImages(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
+	const auto image_bindings = Config::VulkanDebugMarkersEnabled()
+	                                ? DescribeImageBindings(bindings, m_context.GetTextureCache())
+	                                : std::string {};
+	ScopedVulkanDebugLabel dispatch_label(
+	    vk_buffer, std::array {0.72f, 0.28f, 0.90f, 1.0f},
+	    "Kyty.Dispatch submit={} frame={} CS=0x{:016x} groups={}x{}x{} local={}x{}x{} "
+	    "mode=0x{:08x} CSI={}",
+	    submit_id, frame_num, input_info.stage.program->shader_hash, thread_group_x, thread_group_y,
+	    thread_group_z, input_info.threads_num[0], input_info.threads_num[1],
+	    input_info.threads_num[2], mode, image_bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});

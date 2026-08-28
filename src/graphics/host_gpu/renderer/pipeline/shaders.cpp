@@ -932,6 +932,13 @@ void CreatePipelineInternal(
 	pipeline_info.sType                    = vk::StructureType::eGraphicsPipelineCreateInfo;
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.flags                    = {};
+	if (rendering.color_feedback_loop) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eColorAttachmentFeedbackLoopEXT;
+	}
+	if (rendering.depth_feedback_loop) {
+		pipeline_info.flags |=
+		    vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
+	}
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = &vertex_input_info;

@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pm4Inspector.h"
 #include "graphics/guest_gpu/resourceRegistry.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -19,9 +20,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
-#include "kernel/memory.h"
 #include "libs/agc.h"
-#include "libs/errno.h"
 
 #include <algorithm>
 #include <array>
@@ -77,22 +76,15 @@ static bool ReadGuestWordsForInspector(uint64_t address, uint32_t size_dw,
 	if (size_dw == 0) {
 		return true;
 	}
-	constexpr uint32_t CpuReadProtection = 0x01u;
-	const uint64_t     size_bytes        = static_cast<uint64_t>(size_dw) * sizeof(uint32_t);
+	const uint64_t size_bytes = static_cast<uint64_t>(size_dw) * sizeof(uint32_t);
 	if (address == 0 || address > std::numeric_limits<uint64_t>::max() - size_bytes) {
 		return false;
 	}
-	const uint64_t end = address + size_bytes;
-	for (uint64_t cursor = address; cursor < end;) {
-		LibKernel::Memory::VirtualQueryInfo info {};
-		if (LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(cursor), 0, &info,
-		                                          sizeof(info)) != OK ||
-		    info.is_committed == 0 ||
-		    (static_cast<uint32_t>(info.protection) & CpuReadProtection) == 0 ||
-		    info.start > cursor || info.end <= cursor) {
-			return false;
-		}
-		cursor = std::min<uint64_t>(end, info.end);
+	// GPU-visible direct memory can be host-readable even when the guest VM metadata does not
+	// advertise CPU read access. The command processor consumes these indirect packets through
+	// the same host mapping, so validate that mapping instead of rejecting valid GPU memory.
+	if (!HostMemoryRangeIsReadable(address, size_bytes)) {
+		return false;
 	}
 	const auto* first = reinterpret_cast<const uint32_t*>(address);
 	words->assign(first, first + size_dw);
@@ -283,6 +275,8 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	m_occlusion_query_active           = false;
+	m_occlusion_query_begin_address    = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -1583,23 +1577,35 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
-			static std::once_flag warning_once;
-			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
-			});
-
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
-			constexpr uint64_t ready_bit    = 1ull << 63u;
-			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
-			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+			if (!GetScheduler().Active()) {
+				// Unit-test and early-start fallback: publish alternating visible snapshots without
+				// touching Vulkan before a command buffer exists.
+				constexpr uint64_t ready_bit = 1ull << 63u;
+				auto* results = reinterpret_cast<volatile uint64_t*>(event_address);
+				const auto value = ready_bit | (m_occlusion_query_active ? 1u : 0u);
+				for (uint32_t db = 0; db < 16u; db++) {
+					results[db * 2u] = value;
+				}
+				m_occlusion_query_active = !m_occlusion_query_active;
+				break;
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+
+			auto& command = CurrentBuffer();
+			if (!m_occlusion_query_active) {
+				command.BeginOcclusionQuery(event_address);
+				m_occlusion_query_active        = true;
+				m_occlusion_query_begin_address = event_address;
+			} else {
+				if (event_address != m_occlusion_query_begin_address + sizeof(uint64_t)) {
+					command.MarkOcclusionConservativeVisible();
+					LOGF("occlusion query pair is non-contiguous: begin=0x%016" PRIx64
+					     " end=0x%016" PRIx64 "\n",
+					     m_occlusion_query_begin_address, event_address);
+				}
+				command.EndOcclusionQuery(event_address);
+				m_occlusion_query_active        = false;
+				m_occlusion_query_begin_address = 0;
+			}
 			break;
 		}
 		default:

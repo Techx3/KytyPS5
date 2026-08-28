@@ -19,6 +19,10 @@ static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	     "\t mode        = %d\n",
 	     handle, mode);
 
+	if (!Controller::PadHandleIsValid(handle)) {
+		return -2137915389; /* SCE_PAD_ERROR_INVALID_HANDLE */
+	}
+
 	return 0;
 }
 
@@ -32,6 +36,9 @@ static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                           
 
 	LOGF("\t handle = %d\n", handle);
 
+	if (!Controller::PadHandleIsValid(handle)) {
+		return -2137915389; /* SCE_PAD_ERROR_INVALID_HANDLE */
+	}
 	if (info == nullptr) {
 		return -2137653243; /* 0x80960005 */
 	}
@@ -49,7 +56,7 @@ static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
 	     "\t param  = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(param));
 
-	if (handle != 1) {
+	if (!Controller::PadHandleIsValid(handle)) {
 		return -2137915389; /* 0x80920003 */
 	}
 	if (param == nullptr) {
@@ -106,7 +113,7 @@ PadDeviceClassGetExtendedInformation(int handle, PadDeviceClassExtendedInformati
 	constexpr int pad_error_invalid_handle = -2137915389; /* 0x80920003 */
 	constexpr int pad_error_invalid_arg    = -2137915391; /* 0x80920001 */
 
-	if (handle != 1) {
+	if (!Controller::PadHandleIsValid(handle)) {
 		return pad_error_invalid_handle;
 	}
 	if (info == nullptr) {
@@ -130,7 +137,7 @@ static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::P
 	     "\t class_data = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), reinterpret_cast<uint64_t>(class_data));
 
-	if (handle != 1) {
+	if (!Controller::PadHandleIsValid(handle)) {
 		return pad_error_invalid_handle;
 	}
 	if (data == nullptr || class_data == nullptr) {
@@ -159,15 +166,11 @@ static int KYTY_SYSV_ABI PadSetTiltCorrectionState(int handle, bool enabled) {
 	     "\t enabled = %d\n",
 	     handle, enabled ? 1 : 0);
 
+	if (!Controller::PadHandleIsValid(handle)) {
+		return -2137915389; /* SCE_PAD_ERROR_INVALID_HANDLE */
+	}
+
 	return 0;
-}
-
-static int KYTY_SYSV_ABI PadClose(int handle) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n", handle);
-
-	return OK;
 }
 
 static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
@@ -207,7 +210,7 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("znaWI0gpuo8", PadGetTriggerEffectState);
 	LIB_FUNC("DscD1i9HX1w", Controller::PadResetLightBar);
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
-	LIB_FUNC("6ncge5+l5Qs", PadClose);
+	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
 }
 

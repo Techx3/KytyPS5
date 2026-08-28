@@ -53,6 +53,10 @@ bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
 }
 
+bool VulkanDebugMarkersEnabled() {
+	return g_config->vulkan_debug_markers_enabled;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
@@ -127,6 +131,28 @@ std::filesystem::path GetUnresolvedImportReport() {
 
 int32_t GetUserId() {
 	return g_config->user_id;
+}
+
+uint32_t GetLocalPlayerCount() {
+	return std::clamp(g_config->local_player_count, 1u, MAX_LOCAL_USERS);
+}
+
+int32_t GetLocalUserId(uint32_t player_index) {
+	EXIT_IF(player_index >= MAX_LOCAL_USERS);
+
+	return g_config->user_id + static_cast<int32_t>(player_index);
+}
+
+int32_t GetLocalUserIndex(int32_t user_id) {
+	const int64_t index = static_cast<int64_t>(user_id) - g_config->user_id;
+
+	return index >= 0 && index < GetLocalPlayerCount() ? static_cast<int32_t>(index) : -1;
+}
+
+const std::string& GetControllerGuid(uint32_t player_index) {
+	EXIT_IF(player_index >= MAX_LOCAL_USERS);
+
+	return g_config->controller_guids[player_index];
 }
 
 const std::string& GetUserName() {

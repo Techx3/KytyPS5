@@ -105,6 +105,10 @@ struct ShaderComputeInputInfo {
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           lds_size_dwords            = 0;
 	uint32_t           scratch_size_dwords        = 0;
+	uint8_t            float_mode                 = 0;
+	bool               dx10_clamp                 = false;
+	bool               ieee_mode                  = false;
+	bool               fp16_overflow              = false;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               needs_lds_barriers          = false;
@@ -115,6 +119,8 @@ struct ShaderComputeInputInfo {
 	ShaderStageRuntime stage;
 };
 
+enum class ShaderMrtOutputType : uint8_t { Auto, Float, Uint, Sint };
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -122,10 +128,13 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	ShaderMrtOutputType                            target_output_type[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       mrt_output_mask              = 0;
 	uint32_t                                       push_constant_offset         = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	uint32_t                                       wave_size                    = 64;
+	uint32_t                                       host_subgroup_size           = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_xy                    = false;
@@ -267,7 +276,9 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
                          const ShaderVertexInputInfo&                        vs_info,
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-                         ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv);
+                         ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv,
+                         uint32_t host_subgroup_size = 0,
+                         const std::array<ShaderMrtOutputType, 8>* target_output_types = nullptr);
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                          bool needs_lds_barriers, ShaderComputeInputInfo& input_info,
                          std::span<const uint32_t>& spirv);

@@ -62,6 +62,32 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	    view_info.level_count, view_info.base_layer, view_info.layer_count);
 }
 
+[[nodiscard]] bool IsCompatibleSampledStencil(const ImageInfo& requested, const Image& depth) {
+	if (requested.guest_format != Prospero::BufferFormat::k8UInt ||
+	    requested.pixel_format != vk::Format::eR8Uint || depth.backing.image == nullptr ||
+	    !depth.info.HasStencil()) {
+		return false;
+	}
+	const auto expected_pitch =
+	    requested.samples > 1
+	        ? TileGetDepthPitch(requested.extent.width, 1, std::countr_zero(requested.samples))
+	        : TileGetTexturePitch(requested.guest_format, requested.extent.width,
+	                              requested.tile_mode);
+	return requested.data == depth.info.stencil && requested.extent == depth.info.extent &&
+	       requested.resources == depth.info.resources && requested.samples == depth.info.samples &&
+	       requested.type == depth.info.type && requested.tile_mode == depth.info.tile_mode &&
+	       requested.pitch == expected_pitch && requested.bytes_per_block == 1 &&
+	       !requested.HasStencil() && !requested.HasMetadata();
+}
+
+[[nodiscard]] bool IsStencilAssociationRequest(const ImageInfo& requested,
+                                               TextureCache::BindingType binding,
+                                               const Image& association, const Image& depth) {
+	return binding == TextureCache::BindingType::Texture &&
+	       association.info.data == depth.info.stencil &&
+	       requested.data == association.info.data && IsCompatibleSampledStencil(requested, depth);
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -611,26 +637,36 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    requested.tile_mode == cached.info.tile_mode && !requested.HasStencil() &&
 	    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
-	// PPSA04264
-	const bool retain_cached_layout =
+	const bool same_layout_basis =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
 	    requested.bytes_per_block == cached.info.bytes_per_block &&
-	    requested.data.address == cached.info.data.address &&
-	    requested.data.size < cached.info.data.size && requested.extent == cached.info.extent &&
+	    requested.data.address == cached.info.data.address && requested.extent == cached.info.extent &&
+	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
+	    requested.tile_mode == cached.info.tile_mode && !requested.HasStencil() &&
+	    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
+	// PPSA04264: a smaller view may replace the image format while the full layered owner remains
+	// authoritative. Preserve all three layout fields together when each slice has the same span.
+	const bool retain_partial_cached_layout =
+	    same_layout_basis && requested.data.size < cached.info.data.size &&
 	    requested.resources.levels == 1 && cached.info.resources.levels == 1 &&
 	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
 	    requested.resources.layers < cached.info.resources.layers &&
-	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.tile_mode == cached.info.tile_mode && requested.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].offset == 0 &&
 	    cached.info.mip_layout[0].offset == 0 &&
 	    requested.mip_layout[0].size == requested.data.size &&
 	    cached.info.mip_layout[0].size == cached.info.data.size &&
 	    requested.data.size % requested.resources.layers == 0 &&
 	    cached.info.data.size % cached.info.resources.layers == 0 &&
 	    requested.data.size / requested.resources.layers ==
-	        cached.info.data.size / cached.info.resources.layers &&
-	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
+	        cached.info.data.size / cached.info.resources.layers;
+	// A same-range alias can describe a different mip/layer topology. If the cached topology wins
+	// the established ordering, retain its complete range and mip table instead of copying only its
+	// subresource counts into the requested layout.
+	const bool retain_equal_cached_layout =
+	    same_layout_basis && requested.data == cached.info.data &&
+	    cached.info.resources > requested.resources;
+	const bool retain_cached_layout =
+	    retain_partial_cached_layout || retain_equal_cached_layout;
 	bool recreate = cached.info.resources < requested.resources;
 	switch (binding) {
 		case BindingType::Texture:
@@ -655,9 +691,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.data       = cached.info.data;
 		info.resources  = cached.info.resources;
 		info.mip_layout = cached.info.mip_layout;
-	} else {
-		info.resources = std::max(requested.resources, cached.info.resources);
 	}
+	// The guest range, subresource counts, and mip footprints describe one indivisible layout.
+	// Combining only the resource counts can pair the requested range with cached mip/layer counts
+	// (the ordering is lexicographic), producing a native image whose later upload exceeds that range.
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
@@ -684,7 +721,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		}
 		PrepareImageCopy(replacement);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
-		CommitGpuWrite(replacement);
+		CommitGpuWrite(replacement_id, replacement);
 	} else {
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
@@ -705,12 +742,27 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	// Stencil associations are address-index proxies without a usable guest image layout.
+	// A proxy promoted from an already-created sampled R8 owner may retain its dormant Vulkan
+	// backing until retirement. Resolve it through the live depth owner and never feed the
+	// association record to generic overlap conversion or upload paths.
+	if (cached.depth_id) {
+		const auto depth = m_slot_images.try_get(cached.depth_id);
+		return {depth != nullptr && IsStencilAssociationRequest(requested, binding, cached, *depth)
+		            ? cached_id
+		            : merged_id};
+	}
 
 	if (requested.data.address == cached.info.data.address) {
 		const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 		const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 		if (requested.BlockExtent() != cached.info.BlockExtent() ||
 		    requested_block != cached_block) {
+			if (!merged_id) {
+				if (const auto reinterpreted = ReinterpretBacking(requested, binding, cached_id)) {
+					return {reinterpreted};
+				}
+			}
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
@@ -889,10 +941,11 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 		format           = binding == BindingType::RenderTarget
 		                       ? ImageOps::RenderTargetTransferFormat(info.bytes_per_block)
 		                       : info.guest_format;
-		allow_depth_tile = binding == BindingType::Storage || binding == BindingType::RenderTarget;
+		// kDepth names a guest swizzle family, not necessarily a Vulkan depth aspect. Color textures
+		// may legally use it and still need byte-exact readback when the same memory is reinterpreted.
+		allow_depth_tile = true;
 		plan.swap_bgra16 = info.bgra16;
 	}
-
 	plan.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
@@ -929,6 +982,129 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 	return plan;
 }
 
+ImageId TextureCache::ReinterpretBacking(const ImageInfo& requested, BindingType binding,
+                                         ImageId source_id) {
+	auto source_owner = m_slot_images.try_get(source_id);
+	if (source_owner == nullptr || source_owner->depth_id ||
+	    requested.data != source_owner->info.data ||
+	    (binding != BindingType::Texture && binding != BindingType::Storage &&
+	     binding != BindingType::RenderTarget) ||
+	    requested.samples != 1 || source_owner->info.samples != 1 ||
+	    requested.resources != ImageSubresources {1, 1} ||
+	    source_owner->info.resources != ImageSubresources {1, 1} || requested.IsDepth() ||
+	    source_owner->info.IsDepth() || requested.IsBlock() || source_owner->info.IsBlock() ||
+	    requested.IsVolume() || source_owner->info.IsVolume() || requested.data.size % 4 != 0 ||
+	    requested.HasStencil() || source_owner->info.HasStencil() ||
+	    requested.metadata.compression != VideoOutCompression::Uncompressed ||
+	    source_owner->info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return {};
+	}
+	// Kyty keeps color attachments expanded in their Vulkan image. A DCC owner is therefore a
+	// valid byte source only after any deferred fast clear has been materialized. The reverse
+	// transition may create a DCC render target; FindRenderTarget will register (and, if needed,
+	// consume) its guest metadata after this native byte transfer.
+	const auto source_dcc_materialized = [this](const ImageInfo& info) {
+		if (!info.HasMetadata()) {
+			return true;
+		}
+		if (info.metadata.kind != ImageMetadataKind::Dcc) {
+			return false;
+		}
+		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+		return metadata != m_surface_metas.end() &&
+		       metadata->second.type == MetaDataInfo::Type::Dcc &&
+		       metadata->second.clear_mask == 0;
+	};
+	const bool requested_dcc =
+	    requested.HasMetadata() && requested.metadata.kind == ImageMetadataKind::Dcc &&
+	    binding == BindingType::RenderTarget;
+	if ((requested.HasMetadata() && !requested_dcc) ||
+	    (requested.HasMetadata() && source_owner->info.HasMetadata()) ||
+	    !source_dcc_materialized(source_owner->info)) {
+		return {};
+	}
+
+	RefreshCopySource(source_id);
+	source_owner = m_slot_images.try_get(source_id);
+	if (source_owner == nullptr || !source_dcc_materialized(source_owner->info) ||
+	    !SafeToDownload(*source_owner)) {
+		return {};
+	}
+	auto download = BuildDownload(*source_owner);
+	if (!download.valid) {
+		return {};
+	}
+
+	auto& transfer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+	if (requested.data.size > transfer.Size()) {
+		return {};
+	}
+	auto& staging = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
+	const auto [staging_data, staging_offset] =
+	    staging.Map(requested.data.size,
+	                std::max<uint64_t>({requested.bytes_per_block,
+	                                    source_owner->info.bytes_per_block, 4}));
+	if (staging_data == nullptr) {
+		return {};
+	}
+	if (!LibKernel::Memory::TryReadBacking(requested.data.address, staging_data,
+	                                      requested.data.size)) {
+		staging.Commit();
+		return {};
+	}
+	staging.Commit();
+	transfer.CopyFrom(m_scheduler.Current(), staging, staging_offset, 0,
+	                  requested.data.size, vk::AccessFlagBits::eHostWrite);
+
+	const auto source_binding = source_owner->binding;
+	MetaDataInfo requested_metadata {};
+	bool         restore_requested_metadata = false;
+	if (requested_dcc) {
+		const auto metadata = m_surface_metas.find(requested.metadata.range.address);
+		if (metadata != m_surface_metas.end()) {
+			requested_metadata         = metadata->second;
+			restore_requested_metadata = true;
+		}
+	}
+	const auto destination_id = InsertImage(requested);
+	auto&      destination    = m_slot_images[destination_id];
+	const auto release_destination = [&] {
+		FreeImage(destination_id);
+		if (restore_requested_metadata) {
+			m_surface_metas.insert_or_assign(requested.metadata.range.address,
+			                                 requested_metadata);
+		}
+	};
+	const auto upload = BuildColorTransfer(destination, binding, TransferDirection::Upload);
+	if (!upload.valid) {
+		release_destination();
+		return {};
+	}
+	source_owner = m_slot_images.try_get(source_id);
+	if (source_owner == nullptr) {
+		release_destination();
+		return {};
+	}
+
+	TrackImage(destination_id);
+	PrepareImageCopy(destination);
+	DownloadImageData(*source_owner, transfer, 0, requested.data.size, std::move(download));
+	UploadImage(destination,
+	            ImageDesc {.info = requested, .view_info = {}, .type = binding}, transfer, 0);
+	switch (binding) {
+		case BindingType::Texture: destination.usage.texture = true; break;
+		case BindingType::Storage: destination.usage.storage = true; break;
+		case BindingType::RenderTarget: destination.usage.render_target = true; break;
+		default: break;
+	}
+	CommitGpuWrite(destination_id, destination);
+	if (source_binding.is_bound || source_binding.is_target) {
+		source_owner->binding.needs_rebind = true;
+	}
+	FreeImage(source_id);
+	return destination_id;
+}
+
 void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& source,
                                uint64_t source_offset) {
 	const auto& info   = image.info;
@@ -944,12 +1120,16 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
-			     "pitch=%u levels=%u layers=%u samples=%u\n",
+			     "pitch=%u levels=%u layers=%u samples=%u request_size=0x%016" PRIx64
+			     " request_levels=%u request_layers=%u view_level=%u+%u view_layer=%u+%u\n",
 			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
 			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
 			     static_cast<uint32_t>(plan.layout.surface.texture.block.family), info.extent.width,
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
-			     info.resources.layers, info.samples);
+			     info.resources.layers, info.samples, desc.info.data.size,
+			     desc.info.resources.levels, desc.info.resources.layers,
+			     desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+			     desc.view_info.layer_count);
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
@@ -1090,13 +1270,30 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
 
-	ImageId association {};
+	ImageId sampled_owner {};
+	ImageId existing_proxy {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data.address == stencil.address) {
-			association = id;
+		if (owner == nullptr || owner->info.data != stencil) {
+			continue;
+		}
+		if (owner->depth_id) {
+			existing_proxy = id;
+			continue;
+		}
+		// Storage aliases require their own eStorage-capable color backing. Only an
+		// R8_UINT image already used (or prepared) as sampled may become the proxy;
+		// unrelated color targets and same-range records remain independent.
+		const bool storage_owner = owner->usage.storage || owner->binding.shader_write;
+		const bool sampled = owner->usage.texture ||
+		                     (owner->binding.is_bound && !owner->binding.shader_write);
+		if (!storage_owner && sampled && IsCompatibleSampledStencil(owner->info, depth)) {
+			if (!sampled_owner || owner->binding.is_bound) {
+				sampled_owner = id;
+			}
 		}
 	}
+	ImageId association = sampled_owner ? sampled_owner : existing_proxy;
 	if (!association) {
 		ImageInfo info {};
 		info.data   = stencil;
@@ -1104,6 +1301,15 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		association = InsertImage(info);
 	}
 	auto& record = m_slot_images[association];
+	if (record.binding.is_bound || record.binding.is_target) {
+		record.binding.needs_rebind = true;
+	}
+	if (record.depth_id && record.depth_id != depth_id) {
+		if (auto old_depth = m_slot_images.try_get(record.depth_id);
+		    old_depth != nullptr && (old_depth->binding.is_bound || old_depth->binding.is_target)) {
+			old_depth->binding.needs_rebind = true;
+		}
+	}
 	TouchImage(record);
 	record.AssociateDepth(depth_id);
 }
@@ -1127,7 +1333,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			// A storage alias may have newer native contents and requires eStorage. It
+			// must not mask the exact stencil proxy during a later sampled lookup; that
+			// lookup is resolved through the associated depth/stencil owner below.
+			const bool sampled_uses_storage =
+			    desc.type == BindingType::Texture &&
+			    (image.usage.storage || image.binding.shader_write);
+			if (!image.depth_id && !sampled_uses_storage &&
+			    SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
 		}
@@ -1144,15 +1357,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;
 					view_layer = overlap.layer;
+					// A compatible stencil association is already the authoritative result.
+					// Its intentionally format-less record must never become the requested
+					// layout for a later generic overlap/reinterpretation candidate.
+					if (m_slot_images[result].depth_id) {
+						break;
+					}
 				}
 			}
 		}
 
 		if (result) {
 			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+			if (!resolved.depth_id && exact_format &&
+			    resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.depth_id && resolved.info.resources < desc.info.resources) {
 				FreeImage(result);
 				result = {};
 			}
@@ -1257,7 +1477,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				if (!image.registered || image.depth_id) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
 				}
-				CommitGpuWrite(image);
+				CommitGpuWrite(id, image);
 			}
 			TrackImageDownload(id, image);
 			break;
@@ -1294,7 +1514,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 			EXIT("TextureCache: color target reuses non-DCC metadata\n");
 		}
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(id, image);
 	TrackImageDownload(id, image);
 	const auto view = image.FindView(desc.view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
@@ -1331,7 +1551,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			EXIT("TextureCache: depth target reuses non-HTile metadata\n");
 		}
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(id, image);
 	if (desc.info.HasStencil()) {
 		AssociateStencil(id, desc.info.stencil);
 	}
@@ -1347,12 +1567,15 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
 	TrackImage(id);
-	CommitGpuWrite(image);
+	CommitGpuWrite(id, image);
 }
 
-void TextureCache::CommitGpuWrite(Image& image) {
+void TextureCache::CommitGpuWrite(ImageId id, Image& image) {
 	if (image.depth_id || image.backing.image == nullptr) {
 		EXIT("TextureCache: stencil association cannot own image contents\n");
+	}
+	if (m_slot_images.try_get(id) != &image) {
+		EXIT("TextureCache: GPU write owner does not match its image id\n");
 	}
 	image.ClearBufferModified();
 	if (image.IsCpuDirty()) {
@@ -1437,7 +1660,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		command.Handle().clearDepthStencilImage(
 		    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(selected, image);
 	return true;
 }
 

@@ -148,7 +148,9 @@ int KYTY_SYSV_ABI HttpGetResponseContentLength(int request_id, int* result,
                                                uint64_t* content_length);
 int KYTY_SYSV_ABI HttpsSetSslCallback(int id, HttpsCallback cbfunc, void* user_arg);
 int KYTY_SYSV_ABI HttpsSetMinSslVersion(int id, uint32_t ssl_version);
+int KYTY_SYSV_ABI HttpsEnableOption(int id, uint32_t ssl_flags);
 int KYTY_SYSV_ABI HttpsDisableOption(int id, uint32_t ssl_flags);
+int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int enable);
 int KYTY_SYSV_ABI HttpSetResolveTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetResolveRetry(int id, int32_t retry);
 int KYTY_SYSV_ABI HttpSetConnectTimeOut(int id, uint32_t usec);

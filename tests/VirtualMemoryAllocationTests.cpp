@@ -384,13 +384,16 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	std::memset(reinterpret_cast<void*>(base), 0x3c, commit_size);
 	std::memset(reinterpret_cast<void*>(base + commit_size * 2), 0xa7, commit_size);
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, aperture_len),
-	        "KernelSetPrtAperture");
 	std::vector<uint8_t> bytes(aperture_len, 0x5a);
 	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
 	      "dense backing read accepted a nonresident span");
 	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0x5a; }),
 	      "failed dense backing read modified its destination");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, aperture_len),
+	        "KernelSetPrtAperture");
+	Check(test, Libs::LibKernel::Memory::IsPrtBackingRange(base, bytes.size()),
+	      "valid sparse aperture range was not recognized");
 	Check(test, Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), bytes.size()),
 	      "PRT backing read rejected a valid sparse aperture range");
 	Check(test,
@@ -405,6 +408,9 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	      !Libs::LibKernel::Memory::TryReadPrtBacking(base + commit_size * 2, bytes.data(),
 	                                                  commit_size * 2),
 	      "PRT backing read crossed the registered aperture");
+	Check(test,
+	      !Libs::LibKernel::Memory::IsPrtBackingRange(base + commit_size * 2, commit_size * 2),
+	      "cross-aperture sparse range was recognized");
 
 	constexpr uint64_t unowned_prt = 0x5000000000ull;
 	CheckOk(test,
@@ -414,6 +420,8 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	Check(test,
 	      !Libs::LibKernel::Memory::TryReadPrtBacking(unowned_prt, bytes.data(), commit_size),
 	      "PRT backing read accepted an unowned virtual range");
+	Check(test, !Libs::LibKernel::Memory::IsPrtBackingRange(unowned_prt, commit_size),
+	      "unowned PRT range was recognized");
 	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
 	        "KernelSetPrtAperture(clear)");
 

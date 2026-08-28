@@ -13,6 +13,8 @@
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <fmt/format.h>
 #include <string>
@@ -35,7 +37,8 @@ void        RequireVulkanSuccess(vk::Result result, const char* operation);
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if ((!Config::GraphicsDebugDumpEnabled() && !Config::VulkanDebugMarkersEnabled()) ||
+	    device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}
@@ -49,6 +52,44 @@ void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<A
 	info.pObjectName = name.c_str();
 	(void)device.setDebugUtilsObjectNameEXT(&info);
 }
+
+class ScopedVulkanDebugLabel final {
+public:
+	template <typename... Args>
+	ScopedVulkanDebugLabel(vk::CommandBuffer command, const std::array<float, 4>& color,
+	                       fmt::format_string<Args...> format, Args&&... args) {
+		if (!Config::VulkanDebugMarkersEnabled() || command == nullptr ||
+		    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBeginDebugUtilsLabelEXT == nullptr ||
+		    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdEndDebugUtilsLabelEXT == nullptr) {
+			return;
+		}
+
+		m_command = command;
+		m_name    = fmt::format(format, std::forward<Args>(args)...);
+		vk::DebugUtilsLabelEXT label {};
+		label.sType      = vk::StructureType::eDebugUtilsLabelEXT;
+		label.pLabelName = m_name.c_str();
+		for (size_t i = 0; i < color.size(); i++) {
+			label.color[i] = color[i];
+		}
+		m_command.beginDebugUtilsLabelEXT(&label);
+	}
+
+	~ScopedVulkanDebugLabel() {
+		if (m_command != nullptr) {
+			m_command.endDebugUtilsLabelEXT();
+		}
+	}
+
+	ScopedVulkanDebugLabel(const ScopedVulkanDebugLabel&)            = delete;
+	ScopedVulkanDebugLabel& operator=(const ScopedVulkanDebugLabel&) = delete;
+	ScopedVulkanDebugLabel(ScopedVulkanDebugLabel&&)                 = delete;
+	ScopedVulkanDebugLabel& operator=(ScopedVulkanDebugLabel&&)      = delete;
+
+private:
+	vk::CommandBuffer m_command = nullptr;
+	std::string       m_name;
+};
 
 template <typename T, typename Enumerator>
 [[nodiscard]] std::vector<T> EnumerateVulkan(const char* operation, Enumerator&& enumerate) {

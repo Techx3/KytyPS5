@@ -355,8 +355,11 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.added) {
 		auto* pad = SDL_GameControllerOpen(f.id);
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
-		Controller::ControllerConnect(id);
+		auto* joystick = SDL_GameControllerGetJoystick(pad);
+		int   id       = SDL_JoystickInstanceID(joystick);
+		char  guid[33] = {};
+		SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(joystick), guid, sizeof(guid));
+		Controller::ControllerConnect(id, guid);
 	}
 
 	if (f.removed) {

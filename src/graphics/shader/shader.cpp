@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -54,7 +55,7 @@ constexpr uint32_t PsInputFlatShade  = 0x00000400u;
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+	       Libs::LibKernel::Memory::TryReadGpuSynchronizedBacking(address, value, sizeof(*value));
 }
 
 } // namespace
@@ -842,6 +843,7 @@ static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     const ShaderVertexInputInfo&                        vs_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    const std::array<ShaderMrtOutputType, 8>*            target_output_types,
     ShaderPixelInputInfo&                               ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -858,9 +860,10 @@ static void ShaderGetStaticInputInfoPS(
 	              vs_info.stage.program->bindings.push_constant_size
 	        : 0;
 
-	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
-	// flags in the hardware state and extract only the input count here.
-	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	// Keep SPI_PS_IN_CONTROL flags in hardware state and specialize the shader
+	// only with the fields that affect generated code.
+	ps_info.input_num            = Pm4::PixelInputCount(sh.ps_in_control);
+	ps_info.wave_size            = Pm4::PixelWaveSize(sh.ps_in_control);
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
 	if ((active_inputs & 0x00000002u) != 0) {
@@ -895,6 +898,10 @@ static void ShaderGetStaticInputInfoPS(
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
+		ps_info.target_output_type[i] =
+		    sh.target_output_mode[i] != 0 && target_output_types != nullptr
+		        ? (*target_output_types)[i]
+		        : ShaderMrtOutputType::Auto;
 		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0
 		                                       ? target_export_mapping[i]
 		                                       : Prospero::ColorComponentMapping {};
@@ -917,6 +924,10 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.threads_num[2]      = regs.cs_regs.num_thread_z;
 	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
 	info.scratch_size_dwords = data.scratch_size_dwords;
+	info.float_mode          = regs.cs_regs.float_mode;
+	info.dx10_clamp          = regs.cs_regs.dx10_clamp;
+	info.ieee_mode           = regs.cs_regs.ieee_mode;
+	info.fp16_overflow       = regs.cs_regs.fp16_overflow;
 	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
 	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
 	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
@@ -1176,10 +1187,14 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
                          const ShaderVertexInputInfo&                        vs_info,
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-                         ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv) {
+                         ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv,
+                         uint32_t host_subgroup_size,
+                         const std::array<ShaderMrtOutputType, 8>* target_output_types) {
 	spirv = {};
 
-	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, ps_info);
+	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, target_output_types,
+	                           ps_info);
+	ps_info.host_subgroup_size = host_subgroup_size;
 	const auto shader_hash =
 	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
 	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
@@ -1346,10 +1361,16 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
 	     "\t lds_size_dwords    = %u\n"
+	     "\t float_mode         = %u\n"
+	     "\t dx10_clamp         = %s\n"
+	     "\t ieee_mode          = %s\n"
+	     "\t fp16_overflow      = %s\n"
 	     "\t needs_lds_barriers = %s\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
 	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
+	     info.float_mode, info.dx10_clamp ? "true" : "false",
+	     info.ieee_mode ? "true" : "false", info.fp16_overflow ? "true" : "false",
 	     info.needs_lds_barriers ? "true" : "false",
 	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
 	     info.tg_size_en ? "true" : "false");
@@ -1412,7 +1433,8 @@ static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
 
 static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
                                          std::span<const uint32_t> code,
-                                         const std::string&        decoded_dump) {
+                                         const std::string&        decoded_dump,
+                                         const std::string&        ir_dump = {}) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
@@ -1436,19 +1458,36 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 		bin_file.Close();
 	}
 	if (decoded_dump.empty()) {
-		return;
+		if (ir_dump.empty()) {
+			return;
+		}
 	}
 
-	Common::File text_file;
-	auto         text_name = base_name;
-	text_name += ".rdna2";
-	text_file.Create(text_name);
-	if (text_file.IsInvalid()) {
-		auto text_name_text = Common::PathToString(text_name);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", text_name_text.c_str());
-	} else {
-		text_file.Printf("%s", decoded_dump.c_str());
-		text_file.Close();
+	if (!decoded_dump.empty()) {
+		Common::File text_file;
+		auto         text_name = base_name;
+		text_name += ".rdna2";
+		text_file.Create(text_name);
+		if (text_file.IsInvalid()) {
+			auto text_name_text = Common::PathToString(text_name);
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", text_name_text.c_str());
+		} else {
+			text_file.Printf("%s", decoded_dump.c_str());
+			text_file.Close();
+		}
+	}
+	if (!ir_dump.empty()) {
+		Common::File ir_file;
+		auto         ir_name = base_name;
+		ir_name += ".ir";
+		ir_file.Create(ir_name);
+		if (ir_file.IsInvalid()) {
+			auto ir_name_text = Common::PathToString(ir_name);
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", ir_name_text.c_str());
+		} else {
+			ir_file.Printf("%s", ir_dump.c_str());
+			ir_file.Close();
+		}
 	}
 }
 
@@ -1461,6 +1500,8 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 
 	const uint64_t shader_addr = regs.es_regs.data_addr;
 	const auto code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler VS", regs.gs_regs.chksum);
+	std::span<const uint32_t> compile_code = code;
+	std::vector<uint32_t>     linked_geometry_code;
 
 	ShaderRecompiler::CompileOptions options;
 	options.stage                      = ShaderType::Vertex;
@@ -1475,13 +1516,59 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
 	options.dump_label                 = "ShaderRecompiler VS";
+	const bool split_geometry_shader =
+	    regs.gs_regs.data_addr != 0 && regs.gs_regs.data_addr != shader_addr;
+	if (split_geometry_shader) {
+		// A legacy GsFront/GsBack pair runs as one hardware wave. The front half exits through
+		// the system continuation address in s[6:7]; it is not an in-program indirect branch.
+		const bool linked_geometry_required =
+		    sh.m_geNggSubgrpCntl > 1u || sh.m_vgtGsMaxVertOut > 3u ||
+		    sh.m_geMaxOutputPerSubgroup > 0xc0u;
+		ShaderMappedData back_data;
+		if (!ShaderGetMappedData(regs.gs_regs.data_addr, back_data) ||
+		    back_data.code_size_bytes == 0 || (back_data.code_size_bytes & 3u) != 0) {
+			if (linked_geometry_required) {
+				ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash,
+				                            "GsBack mapped code is unavailable");
+			}
+			options.terminal_external_setpc_sgpr = 6;
+		} else {
+			const auto back_code = std::span<const uint32_t>(
+			    reinterpret_cast<const uint32_t*>(regs.gs_regs.data_addr),
+			    back_data.code_size_bytes / sizeof(uint32_t));
+			if (options.dump_ir) {
+				DumpShaderRecompilerOriginal("gs_back", options.shader_hash, back_code, {}, {});
+			}
+			if (linked_geometry_required) {
+				std::string link_error;
+				if (!ShaderRecompiler::TryLinkSplitGeometryPrograms(
+				        code, back_code, linked_geometry_code, &link_error)) {
+					ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash,
+					                            link_error.c_str());
+				}
+				compile_code       = linked_geometry_code;
+				options.dump_label = "ShaderRecompiler linked ES/GS";
+				LOGF("ShaderRecompiler VS linked GsFront/GsBack hash=0x%016" PRIx64
+				     " front_words=%" PRIu64 " back_words=%" PRIu64 " linked_words=%" PRIu64
+				     "\n",
+				     options.shader_hash, static_cast<uint64_t>(code.size()),
+				     static_cast<uint64_t>(back_code.size()),
+				     static_cast<uint64_t>(compile_code.size()));
+			} else {
+				options.terminal_external_setpc_sgpr = 6;
+			}
+		}
+	}
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
-	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
+	if (!ShaderRecompiler::TryRecompile(compile_code, options, result, &error)) {
+		DumpShaderRecompilerOriginal("vs", options.shader_hash, compile_code, result.decoded_dump,
+		                             result.ir_dump);
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash, error.c_str());
 	}
-	DumpShaderRecompilerOriginal("vs", options.shader_hash, code, result.decoded_dump);
+	DumpShaderRecompilerOriginal("vs", options.shader_hash, compile_code, result.decoded_dump,
+	                             result.ir_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler VS", options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv("vs", options.shader_hash, result.spirv);
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash,
@@ -1524,6 +1611,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.user_data                  = regs.ps_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.input_info.pixel           = &input_info;
+	options.wave_size                  = input_info.wave_size;
+	options.host_subgroup_size         = input_info.host_subgroup_size;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
 	options.dump_label                 = "ShaderRecompiler PS";
@@ -1531,9 +1620,12 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
+		DumpShaderRecompilerOriginal("ps", options.shader_hash, code, result.decoded_dump,
+		                             result.ir_dump);
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash, error.c_str());
 	}
-	DumpShaderRecompilerOriginal("ps", options.shader_hash, code, result.decoded_dump);
+	DumpShaderRecompilerOriginal("ps", options.shader_hash, code, result.decoded_dump,
+	                             result.ir_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler PS", options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv("ps", options.shader_hash, result.spirv);
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash,
@@ -1581,9 +1673,12 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
+		DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump,
+		                             result.ir_dump);
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
 	}
-	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump);
+	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump,
+	                             result.ir_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler CS", options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv("cs", options.shader_hash, result.spirv);
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash,
@@ -1679,6 +1774,8 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 
 	ret.ids.push_back(input_info.push_constant_offset);
 	ret.ids.push_back(input_info.scratch_size_dwords);
+	ret.ids.push_back(input_info.wave_size);
+	ret.ids.push_back(input_info.host_subgroup_size);
 	ret.ids.push_back(input_info.input_num);
 	ret.ids.push_back(input_info.ps_system_input_base);
 	ret.ids.push_back(input_info.custom_interpolation_mask);
@@ -1697,6 +1794,9 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 
 	for (auto mode: input_info.target_output_mode) {
 		ret.ids.push_back(mode);
+	}
+	for (auto type: input_info.target_output_type) {
+		ret.ids.push_back(static_cast<uint32_t>(type));
 	}
 	for (uint32_t base = 0; base < input_info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
@@ -1746,6 +1846,10 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 	ret.ids.push_back(input_info.thread_ids_num);
 	ret.ids.push_back(input_info.lds_size_dwords);
 	ret.ids.push_back(input_info.scratch_size_dwords);
+	ret.ids.push_back(input_info.float_mode);
+	ret.ids.push_back(static_cast<uint32_t>(input_info.dx10_clamp));
+	ret.ids.push_back(static_cast<uint32_t>(input_info.ieee_mode));
+	ret.ids.push_back(static_cast<uint32_t>(input_info.fp16_overflow));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.needs_lds_barriers));
 
 	for (int i = 0; i < 3; i++) {

@@ -7,6 +7,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -14,14 +15,64 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
 namespace Libs::Graphics {
 
+struct OcclusionQueryScope {
+	std::atomic<uint64_t> samples {0};
+	std::atomic<uint32_t> pending_segments {0};
+	std::atomic<uint64_t> end_address {0};
+	std::atomic_bool      closed {false};
+	std::atomic_bool      conservative_visible {false};
+	std::atomic_bool      published {false};
+};
+
 namespace {
+
+constexpr uint64_t OcclusionReadyBit = 1ull << 63u;
+constexpr uint64_t OcclusionCounterMask = OcclusionReadyBit - 1u;
+
+void WriteOcclusionCounters(uint64_t address, uint64_t samples) {
+	if (address == 0 || (address & 0x7u) != 0) {
+		return;
+	}
+
+	samples &= OcclusionCounterMask;
+	const auto per_db   = samples / 16u;
+	const auto remainder = samples % 16u;
+	for (uint32_t db = 0; db < 16u; db++) {
+		const auto value = OcclusionReadyBit | per_db | (db < remainder ? 1u : 0u);
+		if (!LibKernel::Memory::TryWriteBacking(address + static_cast<uint64_t>(db) * 16u,
+		                                        &value, sizeof(value))) {
+			static std::atomic_bool warning_once {false};
+			if (!warning_once.exchange(true, std::memory_order_relaxed)) {
+				LOGF("occlusion query result address is not writable: 0x%016" PRIx64 "\n",
+				     address);
+			}
+			return;
+		}
+	}
+}
+
+void TryPublishOcclusionScope(const std::shared_ptr<OcclusionQueryScope>& scope) {
+	if (!scope || !scope->closed.load(std::memory_order_acquire) ||
+	    scope->pending_segments.load(std::memory_order_acquire) != 0u ||
+	    scope->published.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+
+	auto samples = scope->samples.load(std::memory_order_relaxed);
+	if (scope->conservative_visible.load(std::memory_order_relaxed)) {
+		samples = std::max<uint64_t>(samples, 1u);
+	}
+	WriteOcclusionCounters(scope->end_address.load(std::memory_order_relaxed), samples);
+}
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint64_t submit_seq,
                        uint32_t debug_op, uint64_t debug_submit, uint32_t arg0, uint32_t arg1,
@@ -41,10 +92,23 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint6
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_scheduler(scheduler), m_graphics(scheduler.Graphics()),
-      m_slot(scheduler.AllocateCommandBuffer()) {}
+      m_slot(scheduler.AllocateCommandBuffer()) {
+	vk::QueryPoolCreateInfo create {};
+	create.sType      = vk::StructureType::eQueryPoolCreateInfo;
+	create.queryType  = vk::QueryType::eOcclusion;
+	create.queryCount = OcclusionQueryCapacity;
+	if (m_graphics.device.createQueryPool(&create, nullptr, &m_occlusion_query_pool) !=
+	    vk::Result::eSuccess) {
+		m_occlusion_query_pool = nullptr;
+	}
+}
 
 CommandBuffer::~CommandBuffer() {
 	Release();
+	if (m_occlusion_query_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_occlusion_query_pool, nullptr);
+		m_occlusion_query_pool = nullptr;
+	}
 }
 
 bool CommandBuffer::IsInvalid() const {
@@ -86,6 +150,12 @@ void CommandBuffer::Begin() const {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_occlusion_query_cursor = 0;
+	m_active_occlusion_query.reset();
+	m_occlusion_scope.reset();
+	if (m_occlusion_query_pool != nullptr) {
+		buffer.resetQueryPool(m_occlusion_query_pool, 0, OcclusionQueryCapacity);
+	}
 }
 
 void CommandBuffer::End() const {
@@ -263,15 +333,114 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	Handle().beginRendering(rendering);
 	m_render_state = state;
 	m_rendering    = true;
+	BeginOcclusionSegment();
 }
 
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	auto query = m_active_occlusion_query;
+	auto scope = m_occlusion_scope;
+	if (query.has_value()) {
+		Handle().endQuery(m_occlusion_query_pool, *query);
+		m_active_occlusion_query.reset();
+	}
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	if (query.has_value() && scope) {
+		CompleteOcclusionSegment(*query, scope);
+	}
+}
+
+void CommandBuffer::BeginOcclusionQuery(uint64_t begin_address) {
+	if (m_occlusion_scope) {
+		m_occlusion_scope->conservative_visible.store(true, std::memory_order_relaxed);
+		m_occlusion_scope->end_address.store(begin_address + 8u, std::memory_order_relaxed);
+		m_occlusion_scope->closed.store(true, std::memory_order_release);
+		TryPublishOcclusionScope(m_occlusion_scope);
+	}
+
+	WriteOcclusionCounters(begin_address, 0);
+	m_occlusion_scope = std::make_shared<OcclusionQueryScope>();
+	if (m_rendering) {
+		BeginOcclusionSegment();
+	}
+}
+
+void CommandBuffer::EndOcclusionQuery(uint64_t end_address) {
+	if (!m_occlusion_scope) {
+		WriteOcclusionCounters(end_address, 1);
+		return;
+	}
+
+	// Occlusion queries must end inside dynamic rendering; copying their result must occur after
+	// rendering has ended.
+	EndRendering();
+	auto scope = std::move(m_occlusion_scope);
+	scope->end_address.store(end_address, std::memory_order_relaxed);
+	scope->closed.store(true, std::memory_order_release);
+	TryPublishOcclusionScope(scope);
+}
+
+void CommandBuffer::MarkOcclusionConservativeVisible() const {
+	if (m_occlusion_scope) {
+		m_occlusion_scope->conservative_visible.store(true, std::memory_order_relaxed);
+	}
+}
+
+void CommandBuffer::BeginOcclusionSegment() const {
+	if (!m_occlusion_scope || m_active_occlusion_query.has_value()) {
+		return;
+	}
+	if (m_occlusion_query_pool == nullptr ||
+	    m_occlusion_query_cursor >= OcclusionQueryCapacity) {
+		m_occlusion_scope->conservative_visible.store(true, std::memory_order_relaxed);
+		return;
+	}
+
+	const auto query = m_occlusion_query_cursor++;
+	Handle().beginQuery(m_occlusion_query_pool, query, {});
+	m_active_occlusion_query = query;
+}
+
+void CommandBuffer::CompleteOcclusionSegment(
+	uint32_t query, const std::shared_ptr<OcclusionQueryScope>& scope) const {
+	auto& download = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto [mapped, offset] = download.Map(sizeof(uint64_t), alignof(uint64_t), false);
+	if (mapped == nullptr) {
+		scope->conservative_visible.store(true, std::memory_order_relaxed);
+		return;
+	}
+	download.Commit();
+	scope->pending_segments.fetch_add(1u, std::memory_order_relaxed);
+
+	Handle().copyQueryPoolResults(
+	    m_occlusion_query_pool, query, 1u, download.Handle(), offset, sizeof(uint64_t),
+	    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
+	barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download.Handle();
+	barrier.offset              = offset;
+	barrier.size                = sizeof(uint64_t);
+	Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+	                         nullptr);
+
+	m_scheduler.DeferPriorityOperation([scope, &download, mapped, offset] {
+		download.Invalidate(offset, sizeof(uint64_t));
+		uint64_t samples = 0;
+		std::memcpy(&samples, mapped, sizeof(samples));
+		scope->samples.fetch_add(samples & OcclusionCounterMask, std::memory_order_relaxed);
+		if (scope->pending_segments.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+			TryPublishOcclusionScope(scope);
+		}
+	});
 }
 
 } // namespace Libs::Graphics

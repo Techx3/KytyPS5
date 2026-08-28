@@ -87,11 +87,11 @@ void uc_check(const HW::UserConfig& uc) {
 	const auto& ge_cntl = uc.GetGeControl();
 	const auto& user_en = uc.GetGeUserVgprEn();
 
-	if (ge_cntl.primitive_group_size > 0x0040) {
+	if (ge_cntl.primitive_group_size > 0x01ff) {
 		LOGF("\t warning: unsupported GE_CNTL primitive_group_size = 0x%04" PRIx16 "\n",
 		     ge_cntl.primitive_group_size);
 	}
-	if (ge_cntl.vertex_group_size > 0x0040) {
+	if (ge_cntl.vertex_group_size > 0x01ff) {
 		LOGF("\t warning: unsupported GE_CNTL vertex_group_size = 0x%04" PRIx16 "\n",
 		     ge_cntl.vertex_group_size);
 	}
@@ -682,8 +682,10 @@ static void McCheck(const HW::ModeControl& c) {
 			logged = true;
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype != 0 && c.polymode_front_ptype != 2);
-	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype != 0 && c.polymode_back_ptype != 2);
+	// SDK 10 encodes point, line and fill as 0, 1 and 2. Until non-fill rasterization is
+	// implemented, all three valid modes use the existing filled-polygon fallback.
+	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype > 2);
+	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype > 2);
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {

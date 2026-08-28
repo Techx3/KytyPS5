@@ -4,6 +4,8 @@
 build/
 _Build/vscode-clang/
 _Build/
+_PipelineCache/
+_Tools/
 _DownloadData/
 _SaveData/
 _TempData/

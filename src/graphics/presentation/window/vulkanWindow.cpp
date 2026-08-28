@@ -587,6 +587,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+	const auto feedback_loop_ext_enabled = HasExtension(
+	    device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -597,6 +599,22 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #else
 		supported_fragment_barycentric.pNext = &supported_robustness2;
 #endif
+	}
+
+	vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT supported_feedback_loop {};
+	supported_feedback_loop.sType =
+	    vk::StructureType::ePhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT;
+	supported_feedback_loop.pNext = nullptr;
+	if (feedback_loop_ext_enabled) {
+		if (robustness2_ext_enabled) {
+			supported_robustness2.pNext = &supported_feedback_loop;
+		} else {
+#if defined(__APPLE__)
+			supported_features12.pNext = &supported_feedback_loop;
+#else
+			supported_fragment_barycentric.pNext = &supported_feedback_loop;
+#endif
+		}
 	}
 
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
@@ -669,25 +687,37 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
-
+	graphics.attachment_feedback_loop_enabled =
+	    feedback_loop_ext_enabled &&
+	    supported_feedback_loop.attachmentFeedbackLoopLayout == VK_TRUE;
+	vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_loop {};
+	feedback_loop.sType =
+	    vk::StructureType::ePhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT;
+	feedback_loop.attachmentFeedbackLoopLayout =
+	    graphics.attachment_feedback_loop_enabled ? VK_TRUE : VK_FALSE;
 	const bool subgroup_size_control_enabled = graphics.compute_subgroup_size_control_enabled &&
 	                                           supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
 #if defined(__APPLE__)
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&features12);
+	auto* feature_chain = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                              : static_cast<void*>(&features12);
 #else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
+	auto* feature_chain = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                              : static_cast<void*>(&fragment_barycentric);
 #endif
+	feedback_loop.pNext = feature_chain;
+	features13.pNext = graphics.attachment_feedback_loop_enabled
+	                       ? static_cast<void*>(&feedback_loop)
+	                       : feature_chain;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
-
+	LOGF("Vulkan attachment feedback loop: %s\n",
+	     graphics.attachment_feedback_loop_enabled ? "enabled" : "unavailable");
 	vk::DeviceCreateInfo create_info {};
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
 	create_info.pNext                   = &features13;
@@ -1061,6 +1091,10 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions,
+		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 		}
 	}
 

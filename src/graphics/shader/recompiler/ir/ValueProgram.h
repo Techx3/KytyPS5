@@ -21,11 +21,19 @@ struct ValueBlockInfo {
 
 struct DescriptorSource {
 	struct IndirectImage {
-		uint32_t material_source = 0;
-		uint32_t heap_source     = 0;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
-		uint32_t key_arg         = 0;
+		static constexpr uint32_t NoEntryCountSource = UINT32_MAX;
+
+		uint32_t material_source    = 0;
+		uint32_t heap_source        = 0;
+		uint32_t entry_count_source = NoEntryCountSource;
+		uint32_t selector_stride    = 0;
+		uint32_t selector_offset    = 0;
+		uint32_t direct_key_stride  = 0;
+		uint32_t direct_key_offset  = 0;
+		uint32_t direct_key_count   = 0;
+		uint32_t key_arg            = 0;
+		uint32_t entry_count        = 0;
+		bool     direct_address     = false;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

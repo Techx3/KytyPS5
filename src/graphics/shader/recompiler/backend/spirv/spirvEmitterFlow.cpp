@@ -108,6 +108,17 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 	return EmitInputComponentU32(state, kind, component);
 }
 
+uint32_t EmitGuestLaneId(EmitterState& state) {
+	if (state.stage == ShaderType::Compute && state.wave_size == 64u) {
+		const auto local_index = EmitLocalInvocationIndex(state);
+		const auto lane        = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, local_index,
+		                           ConstantU32(state, 63)});
+		return lane;
+	}
+	return EmitSubgroupLocalInvocationId(state);
+}
+
 uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 	auto&      state  = ctx.state;
 	const auto ballot = state.builder.AllocateId();
@@ -282,6 +293,22 @@ uint32_t MrtOutputMode(const EmitterState& state, const IR::ExportInfo& exp) {
 	return state.input_info.pixel->target_output_mode[exp.index];
 }
 
+ShaderMrtOutputType MrtOutputType(const EmitterState& state, const IR::ExportInfo& exp) {
+	if (state.stage != ShaderType::Pixel || exp.kind != IR::ExportTargetKind::Mrt ||
+	    exp.index >= std::size(state.input_info.pixel->target_output_type)) {
+		return ShaderMrtOutputType::Float;
+	}
+	const auto explicit_type = state.input_info.pixel->target_output_type[exp.index];
+	if (explicit_type != ShaderMrtOutputType::Auto) {
+		return explicit_type;
+	}
+	switch (MrtOutputMode(state, exp)) {
+		case 7u: return ShaderMrtOutputType::Uint;
+		case 8u: return ShaderMrtOutputType::Sint;
+		default: return ShaderMrtOutputType::Float;
+	}
+}
+
 uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t component) {
 	const auto value = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(
@@ -290,9 +317,9 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 }
 
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      bool uint_output) {
+	                  ShaderMrtOutputType output_type) {
 	auto& state = ctx.state;
-	if (exp.compr && !uint_output) {
+	if (exp.compr && output_type == ShaderMrtOutputType::Float) {
 		const auto unpack =
 		    MrtOutputMode(state, exp) == 5u ? GlslUnpackUnorm2x16 : GlslUnpackHalf2x16;
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
@@ -324,7 +351,7 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 	    ConstantU32(state, 0),
 	    ConstantU32(state, 0),
 	    ConstantU32(state, 0),
-	    ConstantU32(state, uint_output ? 1u : 0x3f800000u),
+	    ConstantU32(state, output_type == ShaderMrtOutputType::Float ? 0x3f800000u : 1u),
 	};
 	if (exp.compr) {
 		for (uint32_t pair = 0; pair < 2u; pair++) {
@@ -337,10 +364,17 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 				if (((exp.en >> component) & 1u) == 0u) {
 					continue;
 				}
-				raw[component] = state.builder.AllocateId();
-				state.builder.AddFunction({OpBitFieldUExtract, TypeU32(state), raw[component],
-				                           packed, ConstantU32(state, lane * 16u),
-				                           ConstantU32(state, 16)});
+				if (output_type == ShaderMrtOutputType::Sint) {
+					raw[component] = state.builder.AllocateId();
+					state.builder.AddFunction({OpBitFieldSExtract, TypeU32(state), raw[component],
+					                           packed, ConstantU32(state, lane * 16u),
+					                           ConstantU32(state, 16)});
+				} else {
+					raw[component] = state.builder.AllocateId();
+					state.builder.AddFunction({OpBitFieldUExtract, TypeU32(state), raw[component],
+					                           packed, ConstantU32(state, lane * 16u),
+					                           ConstantU32(state, 16)});
+				}
 			}
 		}
 	} else {
@@ -350,10 +384,22 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 			}
 		}
 	}
-	if (uint_output) {
+	if (output_type == ShaderMrtOutputType::Uint) {
 		const auto vector = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(state, 4), vector, raw[0],
 		                           raw[1], raw[2], raw[3]});
+		return vector;
+	}
+	if (output_type == ShaderMrtOutputType::Sint) {
+		uint32_t i32[4] {};
+		for (uint32_t component = 0; component < 4u; component++) {
+			i32[component] = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpBitcast, TypeI32(state), i32[component], raw[component]});
+		}
+		const auto vector = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeConstruct, TypeI32Vector(state, 4), vector, i32[0],
+		                           i32[1], i32[2], i32[3]});
 		return vector;
 	}
 	uint32_t f32[4] {};
@@ -454,9 +500,14 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
-		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		const auto output_type = MrtOutputType(state, exp);
+		uint32_t   vector_type = TypeF32Vector(state, 4);
+		if (output_type == ShaderMrtOutputType::Uint) {
+			vector_type = TypeU32Vector(state, 4);
+		} else if (output_type == ShaderMrtOutputType::Sint) {
+			vector_type = TypeI32Vector(state, 4);
+		}
+		auto value = ExportVector(ctx, data, exp, output_type);
 		if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
@@ -495,9 +546,16 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::TtraceData:
 		case IR::ValueOpcode::InstPrefetch: return true;
 		case IR::ValueOpcode::Barrier: {
-			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
-			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
-			                           ConstantU32(state, ScopeWorkgroup),
+			// Vulkan only permits workgroup barriers in compute-like execution models. Graphics
+			// shaders still need the execution rendezvous used by PS5 wave code, but their LDS is
+			// lowered to function storage, so a subgroup barrier is the strongest legal match.
+			const bool compute   = state.stage == ShaderType::Compute;
+			const auto scope     = compute ? ScopeWorkgroup : ScopeSubgroup;
+			const auto semantics = MemorySemanticsAcquireRelease |
+			                       (compute ? MemorySemanticsWorkgroupMemory
+			                                : MemorySemanticsUniformMemory);
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, scope),
+			                           ConstantU32(state, scope),
 			                           ConstantU32(state, semantics)});
 			return true;
 		}
@@ -556,7 +614,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitWqm(ctx, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
+			ctx.Define(inst, EmitGuestLaneId(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
 			ctx.Emit(inst, OpGroupNonUniformBallot, IR::Type::U32x4,

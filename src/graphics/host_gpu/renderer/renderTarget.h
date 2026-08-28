@@ -31,6 +31,8 @@ struct RenderState {
 	uint32_t                                                   height                = 0;
 	uint32_t                                                   num_layers            = 1;
 	uint32_t                                                   num_color_attachments = 0;
+	bool                                                       color_feedback_loop   = false;
+	bool                                                       depth_feedback_loop   = false;
 
 	bool operator==(const RenderState&) const = default;
 };
@@ -65,6 +67,18 @@ inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint3
 	}
 	return {base_layer == last_layer ? TargetViewType::Image2D : TargetViewType::Image2DArray,
 	        base_layer, last_layer - base_layer + 1u, last_layer + 1u};
+}
+
+[[nodiscard]] inline constexpr TargetViewInfo
+ResolveVolumeTargetViewInfo(uint32_t base_layer, uint32_t last_layer, uint32_t mip_depth,
+                            uint32_t draw_layer_offset = 0) {
+	if (mip_depth == 0 || base_layer >= mip_depth) {
+		return {};
+	}
+	// AGC uses the color-view range to route GS-exported Z for 3D targets. Its toolkit
+	// clamps the inclusive maximum slice to the selected mip depth before drawing.
+	const auto clamped_last_layer = last_layer < mip_depth ? last_layer : mip_depth - 1u;
+	return ResolveTargetViewInfo(base_layer, clamped_last_layer, draw_layer_offset);
 }
 
 #pragma pack(push, 1)

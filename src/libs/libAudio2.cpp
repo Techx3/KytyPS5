@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace Libs::Audio {
@@ -179,16 +181,21 @@ struct AudioOut2ContextState {
 };
 
 struct AudioOut2PortStateEntry {
-	bool                   used          = false;
-	AudioOut2PortHandle    handle        = 0;
-	AudioOut2ContextHandle context       = 0;
-	uint16_t               port_type     = 0;
-	uint32_t               data_format   = 0;
-	uint32_t               sampling_freq = 48000;
-	uint32_t               samples_num   = 512;
-	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
-	int                    audio_handle  = 0;
-	const void*            pcm_data      = nullptr;
+	bool                   used                = false;
+	AudioOut2PortHandle    handle              = 0;
+	AudioOut2ContextHandle context             = 0;
+	uint16_t               port_type           = 0;
+	uint32_t               data_format         = 0;
+	uint32_t               sampling_freq       = 48000;
+	uint32_t               samples_num         = 512;
+	AudioInternal::Format  audio_format        = AudioInternal::Format::Unknown;
+	int                    audio_handle        = 0;
+	const void*            pcm_data            = nullptr;
+	float                  gain                = 1.0f;
+	uint32_t               passthrough_channel = 0;
+	uint32_t               ambisonics_channel  = 0;
+	bool                   has_passthrough     = false;
+	bool                   has_ambisonics      = false;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -221,9 +228,12 @@ static constexpr int AUDIO_OUT2_ERROR_INVALID_PARAM               = -2144960511;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
-static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
-static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_DEFAULT  = 1;
-static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH_CHANNEL         = 5;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS_CHANNEL          = 8;
+static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING                    = 2;
+static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_DEFAULT                   = 1;
+static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2                        = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_DEFAULT = 0x01010001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_V2      = 0x01020001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_LIMITER_DEFAULT    = 0x01010003;
@@ -297,6 +307,149 @@ static bool audioout2_port_type_is_object(uint16_t port_type) {
 	return (port_type & 0xff00u) == 0x0100u;
 }
 
+static uint32_t audioout2_format_channels(AudioInternal::Format format) {
+	switch (format) {
+		case AudioInternal::Format::Signed16bitMono:
+		case AudioInternal::Format::FloatMono: return 1;
+		case AudioInternal::Format::Signed16bitStereo:
+		case AudioInternal::Format::FloatStereo: return 2;
+		case AudioInternal::Format::Signed16bit8Ch:
+		case AudioInternal::Format::Float8Ch:
+		case AudioInternal::Format::Signed16bit8ChStd:
+		case AudioInternal::Format::Float8ChStd: return 8;
+		default: return 0;
+	}
+}
+
+static bool audioout2_format_is_float(AudioInternal::Format format) {
+	return format == AudioInternal::Format::FloatMono ||
+	       format == AudioInternal::Format::FloatStereo ||
+	       format == AudioInternal::Format::Float8Ch ||
+	       format == AudioInternal::Format::Float8ChStd;
+}
+
+static size_t audioout2_buffer_size(const AudioOut2PortStateEntry& state) {
+	const auto channels = audioout2_format_channels(state.audio_format);
+	const auto sample_size =
+	    audioout2_format_is_float(state.audio_format) ? sizeof(float) : sizeof(int16_t);
+	return static_cast<size_t>(state.samples_num) * channels * sample_size;
+}
+
+static float audioout2_read_mono_sample(const AudioOut2PortStateEntry& state, uint32_t frame) {
+	if (state.pcm_data == nullptr || frame >= state.samples_num) {
+		return 0.0f;
+	}
+	if (state.audio_format == AudioInternal::Format::FloatMono) {
+		float sample = 0.0f;
+		std::memcpy(&sample,
+		            static_cast<const uint8_t*>(state.pcm_data) +
+		                static_cast<size_t>(frame) * sizeof(float),
+		            sizeof(sample));
+		return std::isfinite(sample) ? sample : 0.0f;
+	}
+	if (state.audio_format == AudioInternal::Format::Signed16bitMono) {
+		int16_t sample = 0;
+		std::memcpy(&sample,
+		            static_cast<const uint8_t*>(state.pcm_data) +
+		                static_cast<size_t>(frame) * sizeof(int16_t),
+		            sizeof(sample));
+		return static_cast<float>(sample) / 32768.0f;
+	}
+	return 0.0f;
+}
+
+static float audioout2_read_mix_sample(const AudioOut2PortStateEntry& state,
+                                       const std::vector<uint8_t>& buffer, uint32_t frame,
+                                       uint32_t channel) {
+	const auto channels = audioout2_format_channels(state.audio_format);
+	const auto index    = static_cast<size_t>(frame) * channels + channel;
+	if (audioout2_format_is_float(state.audio_format)) {
+		float sample = 0.0f;
+		std::memcpy(&sample, buffer.data() + index * sizeof(float), sizeof(sample));
+		return std::isfinite(sample) ? sample : 0.0f;
+	}
+	int16_t sample = 0;
+	std::memcpy(&sample, buffer.data() + index * sizeof(int16_t), sizeof(sample));
+	return static_cast<float>(sample) / 32768.0f;
+}
+
+static void audioout2_write_mix_sample(const AudioOut2PortStateEntry& state,
+                                       std::vector<uint8_t>* buffer, uint32_t frame,
+                                       uint32_t channel, float sample) {
+	const auto channels = audioout2_format_channels(state.audio_format);
+	const auto index    = static_cast<size_t>(frame) * channels + channel;
+	sample              = std::clamp(sample, -1.0f, 1.0f);
+	if (audioout2_format_is_float(state.audio_format)) {
+		std::memcpy(buffer->data() + index * sizeof(float), &sample, sizeof(sample));
+		return;
+	}
+	const auto scaled = static_cast<int32_t>(std::lrint(sample * 32767.0f));
+	const auto pcm    = static_cast<int16_t>(
+	    std::clamp(scaled, static_cast<int32_t>(std::numeric_limits<int16_t>::min()),
+	               static_cast<int32_t>(std::numeric_limits<int16_t>::max())));
+	std::memcpy(buffer->data() + index * sizeof(int16_t), &pcm, sizeof(pcm));
+}
+
+static bool audioout2_mix_objects(const AudioOut2PortStateEntry&                     target,
+                                  const std::vector<const AudioOut2PortStateEntry*>& objects,
+                                  std::vector<uint8_t>*                              mixed) {
+	const auto target_channels = audioout2_format_channels(target.audio_format);
+	if (target.pcm_data == nullptr || target_channels < 2 || mixed == nullptr) {
+		return false;
+	}
+
+	mixed->resize(audioout2_buffer_size(target));
+	std::memcpy(mixed->data(), target.pcm_data, mixed->size());
+
+	bool changed = false;
+	for (uint32_t frame = 0; frame < target.samples_num; frame++) {
+		float ambisonics_w      = 0.0f;
+		float ambisonics_y      = 0.0f;
+		float ambisonics_x      = 0.0f;
+		float passthrough_left  = 0.0f;
+		float passthrough_right = 0.0f;
+
+		for (const auto* object: objects) {
+			if (object == nullptr || object->sampling_freq != target.sampling_freq ||
+			    frame >= object->samples_num) {
+				continue;
+			}
+			const auto sample = audioout2_read_mono_sample(*object, frame) * object->gain;
+			if (object->has_ambisonics && object->ambisonics_channel >= 64u) {
+				switch (object->ambisonics_channel - 64u) {
+					case 0: ambisonics_w += sample; break; // ACN W
+					case 1: ambisonics_y += sample; break; // ACN Y
+					case 3: ambisonics_x += sample; break; // ACN X
+					default: break;
+				}
+			} else if (object->has_passthrough) {
+				if (object->passthrough_channel == 1u) {
+					passthrough_left += sample;
+				} else if (object->passthrough_channel == 2u) {
+					passthrough_right += sample;
+				}
+			}
+		}
+
+		// Decode the first-order ACN/SN3D components to virtual speakers at +/-30 degrees.
+		// Higher-order channels refine directionality but are intentionally omitted from a stereo
+		// fallback; summing them as speaker feeds produces severe phase and level errors.
+		const float ambisonics_front = 0.70710678f * ambisonics_w + 0.86602540f * ambisonics_x;
+		const float object_left      = ambisonics_front + 0.5f * ambisonics_y + passthrough_left;
+		const float object_right     = ambisonics_front - 0.5f * ambisonics_y + passthrough_right;
+		if (object_left == 0.0f && object_right == 0.0f) {
+			continue;
+		}
+
+		const auto left  = audioout2_read_mix_sample(target, *mixed, frame, 0) + object_left;
+		const auto right = audioout2_read_mix_sample(target, *mixed, frame, 1) + object_right;
+		audioout2_write_mix_sample(target, mixed, frame, 0, left);
+		audioout2_write_mix_sample(target, mixed, frame, 1, right);
+		changed = true;
+	}
+	return changed;
+}
+
 static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 	if (state == nullptr) {
 		return;
@@ -350,12 +503,39 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
+	std::vector<const AudioOut2PortStateEntry*> objects;
+	objects.reserve(g_audioout2_ports.size());
+	std::vector<uint8_t> mixed;
 
 	g_audioout2_port_mutex.Lock();
+	const AudioOut2PortStateEntry* mix_target = nullptr;
 	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == ctx && state.audio_handle > 0 &&
-		    state.pcm_data != nullptr && params.size() < AudioInternal::OUT_PORTS_MAX) {
+		if (!state.used || state.context != ctx || state.pcm_data == nullptr) {
+			continue;
+		}
+		if (audioout2_port_type_is_object(state.port_type)) {
+			if ((state.has_ambisonics || state.has_passthrough) &&
+			    (state.audio_format == AudioInternal::Format::FloatMono ||
+			     state.audio_format == AudioInternal::Format::Signed16bitMono)) {
+				objects.push_back(&state);
+			}
+			continue;
+		}
+		if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data});
+			if (mix_target == nullptr && (state.port_type & 0xffu) == 0u &&
+			    audioout2_format_channels(state.audio_format) >= 2u) {
+				mix_target = &state;
+			}
+		}
+	}
+	if (mix_target != nullptr && !objects.empty() &&
+	    audioout2_mix_objects(*mix_target, objects, &mixed)) {
+		for (auto& param: params) {
+			if (param.handle == mix_target->audio_handle) {
+				param.data = mixed.data();
+				break;
+			}
 		}
 	}
 	g_audioout2_port_mutex.Unlock();
@@ -507,8 +687,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
 		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
 		// vibration/failed-open handle) has no downstream operation that can block this call.
-		const bool use_device_clock =
-		    blocking != 0 && audioout2_context_has_queueable_device(ctx);
+		const bool use_device_clock = blocking != 0 && audioout2_context_has_queueable_device(ctx);
 
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
@@ -659,25 +838,51 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
 
-	const void* pcm_data = nullptr;
-	bool        has_pcm  = false;
-	for (uint32_t i = 0; i < num; i++) {
-		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
-		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
-			AudioOut2Pcm pcm {};
-			std::memcpy(&pcm, attributes[i].value, sizeof(AudioOut2Pcm));
-			pcm_data = pcm.data;
-			has_pcm  = true;
+	g_audioout2_port_mutex.Lock();
+	if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
+		for (uint32_t i = 0; i < num; i++) {
+			const auto& attribute = attributes[i];
+			if (attribute.value == nullptr) {
+				continue;
+			}
+			switch (attribute.attribute_id) {
+				case AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM:
+					if (attribute.value_size >= sizeof(AudioOut2Pcm)) {
+						AudioOut2Pcm pcm {};
+						std::memcpy(&pcm, attribute.value, sizeof(pcm));
+						state->pcm_data = pcm.data;
+					}
+					break;
+				case AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN:
+					if (attribute.value_size == sizeof(float)) {
+						float gain = 1.0f;
+						std::memcpy(&gain, attribute.value, sizeof(gain));
+						if (std::isfinite(gain)) {
+							state->gain = std::clamp(gain, 0.0f, 16.0f);
+						}
+					}
+					break;
+				case AUDIO_OUT2_PORT_ATTRIBUTE_ID_PASSTHROUGH_CHANNEL:
+					if (attribute.value_size == sizeof(uint32_t)) {
+						std::memcpy(&state->passthrough_channel, attribute.value,
+						            sizeof(state->passthrough_channel));
+						state->has_passthrough =
+						    state->passthrough_channel == 1u || state->passthrough_channel == 2u;
+					}
+					break;
+				case AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS_CHANNEL:
+					if (attribute.value_size == sizeof(uint32_t)) {
+						std::memcpy(&state->ambisonics_channel, attribute.value,
+						            sizeof(state->ambisonics_channel));
+						state->has_ambisonics =
+						    state->ambisonics_channel >= 64u && state->ambisonics_channel < 100u;
+					}
+					break;
+				default: break;
+			}
 		}
 	}
-
-	if (has_pcm) {
-		g_audioout2_port_mutex.Lock();
-		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
-			state->pcm_data = pcm_data;
-		}
-		g_audioout2_port_mutex.Unlock();
-	}
+	g_audioout2_port_mutex.Unlock();
 
 	return OK;
 }

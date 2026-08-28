@@ -387,6 +387,23 @@ constexpr uint32_t SPI_SHADER_POS_FORMAT  = 0x1C3;
 constexpr uint32_t SPI_SHADER_Z_FORMAT    = 0x1C4;
 constexpr uint32_t SPI_SHADER_COL_FORMAT  = 0x1C5;
 
+constexpr uint32_t SPI_PS_IN_CONTROL_NUM_INTERP_SHIFT = 0;
+constexpr uint32_t SPI_PS_IN_CONTROL_NUM_INTERP_MASK  = 0x3F;
+constexpr uint32_t SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT  = 15;
+constexpr uint32_t SPI_PS_IN_CONTROL_PS_W32_EN_MASK   = 0x1;
+
+[[nodiscard]] constexpr uint8_t PixelInputCount(uint32_t ps_in_control) {
+	return static_cast<uint8_t>((ps_in_control >> SPI_PS_IN_CONTROL_NUM_INTERP_SHIFT) &
+	                            SPI_PS_IN_CONTROL_NUM_INTERP_MASK);
+}
+
+[[nodiscard]] constexpr uint8_t PixelWaveSize(uint32_t ps_in_control) {
+	return ((ps_in_control >> SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT) &
+	        SPI_PS_IN_CONTROL_PS_W32_EN_MASK) != 0u
+	           ? 32u
+	           : 64u;
+}
+
 constexpr uint32_t CB_BLEND0_CONTROL                            = 0x1E0;
 constexpr uint32_t CB_BLEND0_CONTROL_COLOR_SRCBLEND_SHIFT       = 0;
 constexpr uint32_t CB_BLEND0_CONTROL_COLOR_SRCBLEND_MASK        = 0x1F;

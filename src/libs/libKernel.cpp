@@ -3125,6 +3125,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("j2AIqSqJP0w", FileSystem::KernelGetdents);
 	LIB_FUNC("1-LFLmRFxxM", FileSystem::KernelMkdir);
 	LIB_FUNC("naInUjYt3so", FileSystem::KernelRmdir);
+	LIB_FUNC("0Cq8ipKr9n0", FileSystem::KernelUtimes);
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
 }
 

@@ -2,12 +2,15 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <cinttypes>
 #include <cstring>
+#include <deque>
+#include <mutex>
 
 namespace Libs {
 
@@ -40,18 +43,55 @@ struct UserServiceGamePresets {
 
 static_assert(sizeof(UserServiceGamePresets) == 40);
 
-static bool g_login_event_sent = false;
+static constexpr int USER_ID_INVALID = -1;
+
+static std::mutex                      g_event_mutex;
+static std::deque<SceUserServiceEvent> g_events;
+static uint32_t                        g_login_mask = 0;
+
+static void ResetEvents() {
+	std::lock_guard lock(g_event_mutex);
+	g_events.clear();
+	g_login_mask = 0;
+}
+
+static void RefreshEvents() {
+	const uint32_t  current_mask = Controller::ControllerGetConnectedPlayerMask();
+	std::lock_guard lock(g_event_mutex);
+	const uint32_t  changed_mask = current_mask ^ g_login_mask;
+
+	for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+		const uint32_t bit = 1u << i;
+		if ((changed_mask & bit) != 0 && (current_mask & bit) == 0) {
+			g_events.push_back({UserServiceEventTypeLogout, Config::GetLocalUserId(i)});
+		}
+	}
+	for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+		const uint32_t bit = 1u << i;
+		if ((changed_mask & bit) != 0 && (current_mask & bit) != 0) {
+			g_events.push_back({UserServiceEventTypeLogin, Config::GetLocalUserId(i)});
+		}
+	}
+
+	g_login_mask = current_mask;
+}
+
+static bool IsLocalUser(int user_id) {
+	const int player_index = Config::GetLocalUserIndex(user_id);
+	return player_index >= 0 &&
+	       (Controller::ControllerGetConnectedPlayerMask() & (1u << player_index)) != 0;
+}
 
 static KYTY_SYSV_ABI int UserServiceInitialize(const void* /*params*/) {
 	PRINT_NAME();
-	g_login_event_sent = false;
+	ResetEvents();
 
 	return OK;
 }
 
 static KYTY_SYSV_ABI int UserServiceInitialize2() {
 	PRINT_NAME();
-	g_login_event_sent = false;
+	ResetEvents();
 
 	return OK;
 }
@@ -75,10 +115,11 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
 
-	if (!g_login_event_sent) {
-		g_login_event_sent = true;
-		event->event_type  = UserServiceEventTypeLogin;
-		event->user_id     = Config::GetUserId();
+	RefreshEvents();
+	std::lock_guard lock(g_event_mutex);
+	if (!g_events.empty()) {
+		*event = g_events.front();
+		g_events.pop_front();
 		return OK;
 	}
 
@@ -92,10 +133,11 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
 
-	user_id_list->user_id[0] = Config::GetUserId();
-	user_id_list->user_id[1] = -1;
-	user_id_list->user_id[2] = -1;
-	user_id_list->user_id[3] = -1;
+	const uint32_t login_mask = Controller::ControllerGetConnectedPlayerMask();
+	for (uint32_t i = 0; i < Config::MAX_LOCAL_USERS; i++) {
+		user_id_list->user_id[i] =
+		    (login_mask & (1u << i)) != 0 ? Config::GetLocalUserId(i) : USER_ID_INVALID;
+	}
 
 	return OK;
 }
@@ -106,7 +148,7 @@ static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t 
 	if (name == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -126,11 +168,13 @@ static KYTY_SYSV_ABI int UserServiceGetUserNumber(int user_id, int32_t* number) 
 	if (number == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
+	const int player_index = Config::GetLocalUserIndex(user_id);
+	EXIT_IF(player_index < 0);
 
-	*number = 1;
+	*number = player_index + 1;
 
 	return OK;
 }
@@ -141,7 +185,7 @@ static KYTY_SYSV_ABI int UserServiceGetGamePresets(int user_id, UserServiceGameP
 	if (presets == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -162,7 +206,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityVibration(int user_id, int32
 	if (vibration == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -178,7 +222,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityTriggerEffect(int      user_
 	if (trigger_effect == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -193,7 +237,7 @@ static KYTY_SYSV_ABI int UserServiceGetAgeLevel(int user_id, uint32_t* age_level
 	if (age_level == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -209,7 +253,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityChatTranscription(int      u
 	if (chat_transcription == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -225,7 +269,7 @@ UserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hol
 	if (press_and_hold_delay == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -241,7 +285,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomEnabled(int      user_id
 	if (zoom_enabled == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -257,7 +301,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomFollowFocus(int      use
 	if (zoom_follow_focus == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!IsLocalUser(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 

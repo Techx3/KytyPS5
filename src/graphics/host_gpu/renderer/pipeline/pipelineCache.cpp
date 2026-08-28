@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -182,7 +183,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
     RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
     ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
     ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, bool ps_active, std::span<const uint32_t> vs_spirv,
+    bool primitive_restart_enable, bool ps_active, bool color_feedback_loop,
+    bool depth_feedback_loop, std::span<const uint32_t> vs_spirv,
     std::span<const uint32_t> ps_spirv) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
@@ -198,12 +200,16 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	const auto&           vertex_info                              = sh_ctx.GetVs();
 	const auto&           ps_regs                                  = sh_ctx.GetPs();
 	const HW::BlendColor& bclr                                     = ctx.GetBlendColor();
+	const auto            shader_mask                              = ctx.GetShaderRegisters().m_cbShaderMask;
 	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
-		color_mask[i] =
-		    (colors[i].image_id ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
-		                              ctx.GetRenderTargetMask(), colors[i].target_slot))
-		                        : 0);
+		const auto slot = colors[i].target_slot;
+		color_mask[i] = colors[i].image_id
+		                    ? TextureGetRenderTargetWriteMask(
+		                          colors[i].export_mapping,
+		                          render_target_mask_slot(ctx.GetRenderTargetMask(), slot),
+		                          render_target_mask_slot(shader_mask, slot))
+		                    : 0;
 	}
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -220,7 +226,9 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 
 	static_params.color_count = color_count;
 	PipelineRenderingState rendering {};
-	rendering.color_count       = color_count;
+	rendering.color_count         = color_count;
+	rendering.color_feedback_loop = color_feedback_loop;
+	rendering.depth_feedback_loop = depth_feedback_loop;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		EXIT_IF(!colors[i].image_id || colors[i].format == vk::Format::eUndefined);

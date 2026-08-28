@@ -108,7 +108,8 @@ struct Graph {
 	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
-bool        BuildGraph(const Decoder::Program& program, Graph& graph, std::string* error);
+bool        BuildGraph(const Decoder::Program& program, Graph& graph, std::string* error,
+                       uint32_t terminal_external_setpc_sgpr = UINT32_MAX);
 bool        Structurize(Graph& graph, std::string* error);
 std::string BranchConditionToString(BranchCondition condition);
 std::string FailureKindToString(FailureKind kind);

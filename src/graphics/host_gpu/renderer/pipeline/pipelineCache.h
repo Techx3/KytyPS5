@@ -82,8 +82,8 @@ static_assert(sizeof(PipelineStaticParameters) ==
               sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 2 + sizeof(int[4]) +
                   sizeof(vk::PrimitiveTopology) + sizeof(bool) + sizeof(uint32_t) +
                   sizeof(bool) * 4 + sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 +
-                  sizeof(bool) + sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
-                  sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
+	              sizeof(bool) + sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
+	                  sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
                   sizeof(uint8_t[RENDER_COLOR_ATTACHMENTS_MAX]) * 6 +
                   sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) * 3 + sizeof(float) * 4);
 
@@ -92,6 +92,8 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	bool                                                 color_feedback_loop = false;
+	bool                                                 depth_feedback_loop = false;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -123,6 +125,7 @@ public:
 	                       ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
 	                       ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                       bool primitive_restart_enable, bool ps_active,
+	                       bool color_feedback_loop, bool depth_feedback_loop,
 	                       std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	                                       const HW::ComputeShaderInfo& cs_regs,
@@ -179,6 +182,8 @@ private:
 			}
 			Mix(hash, static_cast<uint32_t>(rendering.depth_format));
 			Mix(hash, static_cast<uint32_t>(rendering.stencil_format));
+			Mix(hash, rendering.color_feedback_loop);
+			Mix(hash, rendering.depth_feedback_loop);
 		}
 	};
 

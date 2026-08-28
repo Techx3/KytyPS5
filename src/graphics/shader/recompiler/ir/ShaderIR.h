@@ -99,6 +99,7 @@ struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
 	uint32_t                sampler                  = 0;
+	uint32_t                point_sampler            = UINT32_MAX;
 	uint32_t                offset                   = 0;
 	uint32_t                secondary_offset         = 0;
 	uint32_t                dmask                    = 0;
@@ -160,7 +161,7 @@ struct Instruction {
 	Opcode       op = Opcode::MoveU32;
 	Operand      dst;
 	Operand      dst2;
-	Operand      src[4];
+	Operand      src[5];
 	uint32_t     src_count = 0;
 	MemoryInfo   memory;
 	ExportInfo   export_info;

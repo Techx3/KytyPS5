@@ -10,6 +10,8 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
@@ -52,6 +54,8 @@ static void PrintUsage() {
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
+	::printf(
+	    "  --vulkan-debug-markers <true|false>  Add lightweight Vulkan labels for GPU tools.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
@@ -71,8 +75,11 @@ static void PrintUsage() {
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --strict-unresolved-imports         Stop when an unresolved import is called.\n");
 	::printf("  --unresolved-import-report <path>   Write unresolved imports as JSON.\n");
-	::printf("  --user-id <positive integer>        Local UserService ID. Default: 1000.\n");
+	::printf("  --user-id <positive integer>        Base ID for local users. Default: 1000.\n");
 	::printf("  --user-name <name>                  Local UserService name. Default: Kyty.\n");
+	::printf("  --local-players <1-4>               Maximum local players. Default: 4.\n");
+	::printf(
+	    "  --controller-guid <P=GUID>          Reserve an SDL GUID for player P; repeatable.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -131,10 +138,48 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 static bool ParseUserId(const std::string& value, int32_t& out) {
 	int32_t user_id   = 0;
 	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), user_id);
-	if (error != std::errc {} || end != value.data() + value.size() || user_id <= 0) {
+	constexpr int32_t max_base_user_id =
+	    INT32_MAX - static_cast<int32_t>(Config::MAX_LOCAL_USERS) + 1;
+	if (error != std::errc {} || end != value.data() + value.size() || user_id <= 0 ||
+	    user_id > max_base_user_id) {
 		return false;
 	}
 	out = user_id;
+	return true;
+}
+
+static bool ParseLocalPlayerCount(const std::string& value, uint32_t& out) {
+	uint32_t player_count = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), player_count);
+	if (error != std::errc {} || end != value.data() + value.size() || player_count < 1 ||
+	    player_count > Config::MAX_LOCAL_USERS) {
+		return false;
+	}
+	out = player_count;
+	return true;
+}
+
+static bool ParseControllerGuid(const std::string& value, Config::ConfigOptions& config) {
+	const auto split = value.find('=');
+	if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
+		return false;
+	}
+
+	uint32_t player   = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + split, player);
+	if (error != std::errc {} || end != value.data() + split || player < 1 ||
+	    player > Config::MAX_LOCAL_USERS) {
+		return false;
+	}
+
+	auto guid = value.substr(split + 1);
+	if (guid.size() != 32 || !std::all_of(guid.begin(), guid.end(),
+	                                      [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+		return false;
+	}
+	std::transform(guid.begin(), guid.end(), guid.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	config.controller_guids[player - 1] = std::move(guid);
 	return true;
 }
 
@@ -241,6 +286,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--vulkan-debug-markers") {
+			if (!ParseBool(value, options.config.vulkan_debug_markers_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu-assisted-validation") {
 			if (!ParseBool(value, options.config.gpu_assisted_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -319,6 +369,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.user_name = value;
+		} else if (arg == "--local-players") {
+			if (!ParseLocalPlayerCount(value, options.config.local_player_count)) {
+				::printf("local players must be between 1 and %u: %s\n", Config::MAX_LOCAL_USERS,
+				         value.c_str());
+				return false;
+			}
+		} else if (arg == "--controller-guid") {
+			if (!ParseControllerGuid(value, options.config)) {
+				::printf("controller GUID must use P=32 hexadecimal digits: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

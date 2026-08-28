@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <array>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -33,6 +34,7 @@ using Keymap = std::vector<std::string>;
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr int32_t  DEFAULT_USER_ID          = 1000;
+constexpr uint32_t MAX_LOCAL_USERS          = 4;
 constexpr size_t   MAX_USER_NAME_LENGTH     = 255;
 
 struct ConfigOptions {
@@ -43,6 +45,7 @@ struct ConfigOptions {
 	uint32_t               vblank_frequency                = 60;
 	uint32_t               console_language                = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled       = false;
+	bool                   vulkan_debug_markers_enabled    = false;
 	bool                   shader_validation_enabled       = false;
 	ShaderOptimizationType shader_optimization_type        = ShaderOptimizationType::None;
 	ShaderLogDirection     shader_log_direction            = ShaderLogDirection::Silent;
@@ -61,8 +64,10 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled             = false;
 	bool                   strict_unresolved_imports       = false;
 	std::filesystem::path  unresolved_import_report;
-	int32_t                user_id   = DEFAULT_USER_ID;
-	std::string            user_name = "Kyty";
+	int32_t                user_id            = DEFAULT_USER_ID;
+	std::string            user_name          = "Kyty";
+	uint32_t               local_player_count = MAX_LOCAL_USERS;
+	std::array<std::string, MAX_LOCAL_USERS> controller_guids;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -78,6 +83,7 @@ PresentMode GetPresentMode();
 uint32_t    GetVblankFrequency();
 uint32_t    GetConsoleLanguage();
 bool        VulkanValidationEnabled();
+bool        VulkanDebugMarkersEnabled();
 
 bool                   ShaderValidationEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
@@ -105,6 +111,10 @@ bool                  PlayGoHackEnabled();
 bool                  StrictUnresolvedImportsEnabled();
 std::filesystem::path GetUnresolvedImportReport();
 int32_t               GetUserId();
+uint32_t              GetLocalPlayerCount();
+int32_t               GetLocalUserId(uint32_t player_index);
+int32_t               GetLocalUserIndex(int32_t user_id);
+const std::string&    GetControllerGuid(uint32_t player_index);
 const std::string&    GetUserName();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

@@ -16,6 +16,7 @@ using Decoder::Opcode;
 struct SetpcTargetInfo {
 	uint32_t              target        = 0;
 	bool                  indirect      = false;
+	bool                  external_exit = false;
 	uint32_t              pc_sgpr       = UINT32_MAX;
 	uint32_t              selector_code = UINT32_MAX;
 	uint32_t              table_load_pc = UINT32_MAX;
@@ -1204,7 +1205,14 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 			const bool true_reaches_false =
 			    CanReachBefore(graph, true_target, false_target, global_merge);
 			if (false_reaches_true != true_reaches_false) {
-				return false_reaches_true ? true_target : false_target;
+				const auto shared = false_reaches_true ? true_target : false_target;
+				const auto other  = false_reaches_true ? false_target : true_target;
+				// Reaching one arm is not enough to make it the merge. Another path may
+				// bypass that arm and reach the terminal merge directly, which would make
+				// the chosen arm branch back into its own SPIR-V selection construct.
+				if (!CanReachBefore(graph, other, global_merge, shared)) {
+					return shared;
+				}
 			}
 		}
 		return global_merge;
@@ -1890,7 +1898,8 @@ bool RouteSharedSelectionArm(Graph& graph, uint32_t route_variable) {
 
 } // namespace
 
-bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* error) {
+bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* error,
+                uint32_t terminal_external_setpc_sgpr) {
 	graph = {};
 
 	if (program.instructions.empty()) {
@@ -1936,26 +1945,40 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
-				SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				           fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc),
-				           error);
-				return false;
-			}
-			const auto& target_pcs = target_info.indirect
-			                             ? target_info.target_pcs
-			                             : std::vector<uint32_t> {target_info.target};
-			for (const auto target: target_pcs) {
-				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
-					SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-					           fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
-					                       inst.pc, target),
-					           error);
+				uint32_t source_sgpr = UINT32_MAX;
+				const bool terminal_external_exit =
+				    i + 1u == program.instructions.size() &&
+				    terminal_external_setpc_sgpr != UINT32_MAX &&
+				    ScalarOperandCode(inst.src0, source_sgpr) &&
+				    source_sgpr == terminal_external_setpc_sgpr;
+				if (!terminal_external_exit) {
+					SetFailure(
+					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+					    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc),
+					    error);
 					return false;
 				}
-				labels.insert(target);
+				target_info.external_exit = true;
+			}
+			if (!target_info.external_exit) {
+				const auto& target_pcs = target_info.indirect
+				                             ? target_info.target_pcs
+				                             : std::vector<uint32_t> {target_info.target};
+				for (const auto target: target_pcs) {
+					if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
+						SetFailure(
+						    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+						    fmt::format(
+						        "S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
+						        inst.pc, target),
+						    error);
+						return false;
+					}
+					labels.insert(target);
+				}
 			}
 			setpc_targets.emplace(inst.pc, std::move(target_info));
-			if (next_pc <= end_pc) {
+			if (!setpc_targets.at(inst.pc).external_exit && next_pc <= end_pc) {
 				labels.insert(next_pc);
 			}
 		} else if (inst.opcode == Opcode::S_ENDPGM) {
@@ -2014,7 +2037,9 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			block.terminator.true_block = pc_to_block.at(end_pc);
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);
-			if (target_info.indirect) {
+			if (target_info.external_exit) {
+				block.terminator.kind = TerminatorKind::Return;
+			} else if (target_info.indirect) {
 				block.terminator.kind                   = TerminatorKind::IndirectBranch;
 				block.terminator.condition              = BranchCondition::Always;
 				block.terminator.indirect_pc_sgpr       = target_info.pc_sgpr;
@@ -2136,6 +2161,38 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 
 namespace {
 
+bool ValidateSelectionConstructEntries(Graph& graph, std::string* error) {
+	for (const auto& header: graph.blocks) {
+		if (header.terminator.kind != TerminatorKind::ConditionalBranch ||
+		    header.terminator.loop_header || header.terminator.merge_block == UINT32_MAX) {
+			continue;
+		}
+
+		const auto merge = header.terminator.merge_block;
+		const auto inside_construct = [&](uint32_t block_id) {
+			return block_id != merge && graph.Dominates(header.id, block_id) &&
+			       !graph.Dominates(merge, block_id);
+		};
+		for (const auto& block: graph.blocks) {
+			if (block.id == header.id || !inside_construct(block.id)) {
+				continue;
+			}
+			for (const auto predecessor: block.predecessors) {
+				if (inside_construct(predecessor)) {
+					continue;
+				}
+				SetFailure(
+				    graph, FailureKind::StructuredControlFlow, header.id,
+				    fmt::format("block {} enters selection headed by block {} at non-header block {}",
+				                predecessor, header.id, block.id),
+				    error);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 bool StructurizeImpl(Graph& graph, std::string* error) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
@@ -2219,7 +2276,7 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 		block.terminator.merge_block = merge;
 	}
 
-	return true;
+	return ValidateSelectionConstructEntries(graph, error);
 }
 
 } // namespace

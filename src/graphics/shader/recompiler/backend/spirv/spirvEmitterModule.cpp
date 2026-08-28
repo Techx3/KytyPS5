@@ -387,10 +387,20 @@ uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarK
 	}
 }
 
-static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
-	return state.stage == ShaderType::Pixel &&
-	       index < std::size(state.input_info.pixel->target_output_mode) &&
-	       state.input_info.pixel->target_output_mode[index] == 7u;
+static ShaderMrtOutputType MrtOutputType(const EmitterState& state, uint32_t index) {
+	if (state.stage != ShaderType::Pixel ||
+	    index >= std::size(state.input_info.pixel->target_output_mode)) {
+		return ShaderMrtOutputType::Float;
+	}
+	const auto explicit_type = state.input_info.pixel->target_output_type[index];
+	if (explicit_type != ShaderMrtOutputType::Auto) {
+		return explicit_type;
+	}
+	switch (state.input_info.pixel->target_output_mode[index]) {
+		case 7u: return ShaderMrtOutputType::Uint;
+		case 8u: return ShaderMrtOutputType::Sint;
+		default: return ShaderMrtOutputType::Float;
+	}
 }
 
 void AllocateInputVariables(EmitterState& state) {
@@ -801,10 +811,15 @@ void DefineModule(EmitterState& state) {
 	for (const auto& binding: state.outputs) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
 		    binding.kind == IR::StageOutputKind::Mrt) {
-			const auto pointer_type =
-			    binding.kind == IR::StageOutputKind::Mrt && MrtUsesUintOutput(state, binding.index)
-			        ? TypePointer(state, StorageClassOutput, TypeU32Vector(state, 4))
-			        : TypePointer(state, StorageClassOutput, TypeF32Vector(state, 4));
+			uint32_t value_type = TypeF32Vector(state, 4);
+			if (binding.kind == IR::StageOutputKind::Mrt) {
+				switch (MrtOutputType(state, binding.index)) {
+					case ShaderMrtOutputType::Uint: value_type = TypeU32Vector(state, 4); break;
+					case ShaderMrtOutputType::Sint: value_type = TypeI32Vector(state, 4); break;
+					default: break;
+				}
+			}
+			const auto pointer_type = TypePointer(state, StorageClassOutput, value_type);
 			state.builder.DefineGlobalVariable(binding.variable_id, pointer_type,
 			                                   StorageClassOutput);
 		}

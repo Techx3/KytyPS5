@@ -180,7 +180,8 @@ private:
 
 	FlipInfo m_flip;
 	uint64_t m_submit_id                   = 0;
-	uint64_t m_synthetic_occlusion_counter = 0;
+	bool     m_occlusion_query_active        = false;
+	uint64_t m_occlusion_query_begin_address = 0;
 	bool     m_predicate_skip              = false;
 };
 
